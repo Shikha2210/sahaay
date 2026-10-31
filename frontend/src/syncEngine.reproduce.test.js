@@ -5,8 +5,12 @@
 import {describe,it,expect,beforeEach,vi} from 'vitest';
 import {db} from './db';
 import {queueOperation,synchronize} from './syncEngine';
+import {startSession} from './session';
+import {setToken} from './api';
+import {makeToken} from './test/helpers';
 
-beforeEach(async()=>{await db.delete();await db.open();localStorage.clear();vi.restoreAllMocks();});
+beforeEach(async()=>{await db.delete();await db.open();localStorage.clear();sessionStorage.clear();setToken(null);vi.restoreAllMocks();
+  startSession({id:'user-a',role:'worker',name:'A',email:'a@example.com'},makeToken(600));});
 
 function mockServer(){
   const sentOrder=[];

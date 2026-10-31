@@ -14,7 +14,7 @@ Principle: fix what the demo story depends on (offline → sync → conflict →
 - Smoke-run the current flow once to **reproduce** S1/S2/C2 so fixes are proven, not assumed.
 - Commit.
 
-## M2 — Backend correctness & security (Backend first)
+## M2 — Backend correctness & security (Backend first) — **SECURITY HALF DONE 2026-11-01; sync-correctness half moved to M2b**
 - Split `main.py` into routers/services (auth, patients, sync, conflicts, identity, chat, audit); no behaviour change first.
 - Config: refuse to start if `JWT_SECRET` is short/placeholder or bootstrap password is default (X1); `SEED_DEMO_DATA` default false.
 - Validation: typed schemas for sync `changes` per field (types/lengths), identity/chat bodies, evidence/link bodies in JSON not query (X6, C7, C10).
@@ -74,3 +74,9 @@ Move/delete folders (M1), change token storage (M6), drop collections/migrate ex
 - Added to M2 (first tasks, because they are security priorities): fail-to-start on weak/missing `JWT_SECRET` and default bootstrap password; `SEED_DEMO_DATA` default false; logout/user-switch wipe of IndexedDB with unsynced-ops warning; per-user tagging of queued ops; 401 handling. Flip the 6 reproduction tests from xfail to normal tests as each bug is fixed.
 - Needs from you before M2 can be fully verified: (1) Atlas M0 cluster + DB user + Network Access entry for your IP → put the URI in `backend/.env`; (2) decision on `AUTH_OPTIONS.md`.
 - Dependency note: `npm audit` shows 1 high + 2 critical in dev tooling; to be reviewed in M6 (not run `audit fix` blindly).
+
+## Update after M2
+* **M2 (done):** security/auth items above. See TEST_REPORT_M2.md.
+* **M2b (next, needs Atlas for real verification):** S1 (create op), S2 (ordered queue), S3 (base_version), S4 (commit-failure result), S15, S14, patient-ID collisions (S8); flip the six reproduction tests to normal tests as each is fixed; first real-Mongo test run (idempotency, transaction, concurrency).
+* Moved: login success/failure audit log → M2b (needs DB); CSP header + self-hosted fonts → M9; idle auto-lock → M7.
+* **Need from you before M2b can be verified:** Atlas M0 + `backend/.env` (`MONGODB_URI`, `JWT_SECRET` from `python -c "import secrets; print(secrets.token_urlsafe(48))"`, `BOOTSTRAP_SUPERVISOR_EMAIL` with a real-looking domain, `BOOTSTRAP_SUPERVISOR_PASSWORD` of your choosing). Code-only work on S1–S4 can still start without it.

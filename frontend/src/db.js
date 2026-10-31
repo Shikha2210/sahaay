@@ -23,6 +23,16 @@ db.version(2).stores({
     if(typeof op.attempts!=='number') op.attempts=0;
   });
 });
+// Version 3: operations are tagged with the user who created them (owner_id) so one user's queued
+// changes can never be sent under another user's session. Existing rows keep their data (untagged rows are
+// claimed by the first user to sign in, see session.js claimDevice).
+db.version(3).stores({
+  patients:'patient_id,name,identity_status',
+  operations:'operation_id,patient_id,status,created_at,device_id,owner_id',
+  conflicts:'conflict_id,patient_id,category,status',
+  audit:'++id,patient_id,event_type,created_at',
+  sync_state:'key'
+});
 export async function seed(){
   // Seed each table independently: existing patients must not prevent missing demo conflicts from being seeded.
   if(await db.patients.count()===0) await db.patients.bulkAdd([

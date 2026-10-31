@@ -108,3 +108,25 @@ Positive: passwords bcrypt-hashed; JWT validated and user re-loaded from DB on e
 3. X2 — PHI left on shared device.
 4. X1 — default admin password.
 5. S4 — possible false "synced".
+
+
+---
+# Status after Milestone 2 (2026-11-01)
+
+| ID | Status | Notes |
+|---|---|---|
+| X1 default admin password / seeding / JWT secret strength | **FIXED** | No built-in password; `BOOTSTRAP_SUPERVISOR_PASSWORD` validated (12+ chars, mixed, no known default/guessable words/email name); `SEED_DEMO_DATA` default false; `JWT_SECRET` required, 32+ chars, not a placeholder; app refuses to start otherwise. Tested (🟡 bootstrap uses a fake collection). |
+| X2 PHI left on device after logout / user switch | **FIXED (logic tested; UI untested in browser)** | Wipe on logout, device-owner lock, explicit discard dialog. Residual: IndexedDB unencrypted; tab closed without logout leaves data until next login (see AUTH_OPTIONS). |
+| X3 token in localStorage / no 401 handling | **PARTIALLY FIXED** | sessionStorage + 60-min tokens + clean 401/expiry handling. Still JS-readable. No refresh tokens/revocation. |
+| X4 token stored before role check | **FIXED** | Login no longer stores anything; token stored only after device-claim succeeds. UI role selector remains cosmetic (backend enforces roles). |
+| X5 login rate limit / audit | **PARTIALLY FIXED** | Rate limit added (per-process memory). Login success/failure **audit logging not done** (needs DB; Milestone 6). |
+| X6 weak validation | **PARTIALLY FIXED** | Typed identity & chat bodies (`extra=forbid`), per-field type/length checks and id formats for sync ops (reported per operation as `rejected`), `status`/other query validation still open. Evidence/link-account still use query parameters (Milestone 3). |
+| X10 CORS | **FIXED** | No wildcard (startup error), credentials off (Bearer header only), methods/headers restricted. |
+| X11 `ObjectId(sub)` 500 | **FIXED** | Bad `sub` → 401. Library maintenance concern (python-jose/passlib) still open. |
+| F8 local seed re-adding fake conflicts | **FIXED** | Local seeding only when `VITE_SEED_DEMO_DATA=true` (default off). |
+| S10 (partial) no fetch timeout | **PARTIALLY FIXED** | 20 s timeout + friendly errors. No max-retry/failed state yet. |
+| S1, S2, S3, S4, S5–S9, S11–S15, C1–C11, X7–X9, X12, I*, AI*, F1–F7, F9, P* | **OPEN** | Unchanged. The 6 reproduction tests still show the expected failures. |
+| **X13 (new)** default `BOOTSTRAP_SUPERVISOR_EMAIL=supervisor@sahaay.local` could never log in | **FIXED** | Found by tests: `.local`/`.test`/`.invalid` are rejected by the same email validation the login form uses (HTTP 422), so the first supervisor was unreachable. Now validated at startup; default/example is `supervisor@example.com`. Regression test added. |
+| **X14 (new)** Idle/unattended device shows cached PHI after token expiry (soft-expiry design) | **OPEN (documented trade-off)** | Consider idle auto-lock (Milestone 6/7). |
+| **X15 (new)** IndexedDB data is unencrypted | **OPEN** | Out of scope for the prototype; document in pitch. |
+| **X16 (new)** No Content-Security-Policy; third-party Google Fonts import | **OPEN → Milestone 9** | Set CSP header on the static host; self-host fonts. |

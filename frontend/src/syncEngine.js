@@ -1,18 +1,25 @@
 import {db} from './db';
-import {api} from './api';
+import {api,getToken,isTokenExpired} from './api';
+import {getSession} from './session';
 
 const DEVICE_KEY='sahaay-device-id';
 export function getDeviceId(){let id=localStorage.getItem(DEVICE_KEY);if(!id){id=crypto.randomUUID();localStorage.setItem(DEVICE_KEY,id);}return id;}
 export async function queueOperation({patient_id,changes,base_version=1,operation_type='update'}){
+  const me=getSession();
+  if(!me?.id) throw new Error('Sign in before creating changes.');
   const operation_id=crypto.randomUUID();
-  await db.operations.add({operation_id,patient_id,device_id:getDeviceId(),base_version,changes:operation_type==='create'?{...changes,__create__:true}:changes,operation_type,status:'pending',attempts:0,created_at:new Date().toISOString(),next_retry_at:0});
+  await db.operations.add({operation_id,patient_id,owner_id:me.id,device_id:getDeviceId(),base_version,changes:operation_type==='create'?{...changes,__create__:true}:changes,operation_type,status:'pending',attempts:0,created_at:new Date().toISOString(),next_retry_at:0});
   return operation_id;
 }
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 export async function synchronize({onProgress=()=>{}}={}){
   if(!navigator.onLine) return {offline:true,uploaded:0,conflicts:0};
+  const me=getSession(); const token=getToken();
+  // No usable session: nothing leaves the device. Local changes stay queued until the user signs in again.
+  if(!me?.id||!token||isTokenExpired(token)) return {authExpired:true,offline:false,uploaded:0,conflicts:0,errors:0};
   let uploaded=0,conflictCount=0,errors=0;
-  const queue=await db.operations.where('status').equals('pending').toArray();
+  // Only operations created by the signed-in user are ever sent; other users' operations are left untouched.
+  const queue=(await db.operations.where('status').equals('pending').toArray()).filter(op=>op.owner_id===me.id);
   for(let offset=0;offset<queue.length;offset+=50){
     const batch=queue.slice(offset,offset+50).filter(op=>(op.next_retry_at||0)<=Date.now());
     if(!batch.length)continue;

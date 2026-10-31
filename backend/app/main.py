@@ -1,17 +1,19 @@
 import uuid, re
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, Query, APIRouter
+from fastapi import FastAPI, Depends, HTTPException, Query, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from pymongo import ReturnDocument
 from bson import ObjectId
 from app.config import settings
 from app.db import client, db, init_db
-from app.schemas import RegisterIn, LoginIn, PatientIn, BatchIn, ResolveIn
-from app.security import hash_password, verify_password, create_token, current_user, require_roles
+from app.schemas import RegisterIn, LoginIn, PatientIn, BatchIn, ResolveIn, IdentityAttemptIn, ChatIn, operation_problem
+from app.security import hash_password, verify_password, create_token, current_user, require_roles, public_user, login_limiter
+from app.config import validate_bootstrap_password, validate_bootstrap_email
 
 UTC=lambda: datetime.now(timezone.utc).isoformat()
+_DUMMY_HASH=hash_password('not-a-real-password-used-only-for-timing')
 DOC_FIELDS={'name','age'}
 PATIENT_FIELDS={'phone','village'}
 CLINICAL_FIELDS={'condition','diagnosis','medications','allergies','treatment_plan','blood_pressure','blood_glucose','dosage'}
@@ -30,8 +32,13 @@ def next_seq(session):
     counter=db.counters.find_one_and_update({'_id':'global_change_seq'},{'$inc':{'value':1}},return_document=ReturnDocument.AFTER,session=session)
     return counter['value']
 def bootstrap():
-    if not db.users.find_one({'email':settings.bootstrap_supervisor_email.lower()}):
-        db.users.insert_one({'name':'SAHAAY Supervisor','email':settings.bootstrap_supervisor_email.lower(),'password_hash':hash_password(settings.bootstrap_supervisor_password),'role':'supervisor','active':True,'created_at':UTC()})
+    # The first supervisor is only created when none exists. There is NO built-in password:
+    # BOOTSTRAP_SUPERVISOR_PASSWORD must be set and strong, otherwise startup stops with a clear message.
+    if not db.users.find_one({'role':'supervisor'}):
+        try: email=validate_bootstrap_email(settings.bootstrap_supervisor_email); pw=validate_bootstrap_password(settings.bootstrap_supervisor_password, email)
+        except ValueError as exc:
+            raise RuntimeError(f'No supervisor account exists yet and the bootstrap password is not usable: {exc}') from exc
+        db.users.insert_one({'name':'SAHAAY Supervisor','email':email.lower(),'password_hash':hash_password(pw),'role':'supervisor','active':True,'created_at':UTC()})
     if settings.seed_demo_data and db.patients.count_documents({})==0:
         samples=[{'patient_id':'SH-2041','name':'Asha Devi','age':38,'phone':'•••• 4821','village':'Rampur','condition':'Hypertension','identity_status':'VERIFIED','last_visit':'Today, 10:40 AM'}, {'patient_id':'SH-2042','name':'Ravi Kumar','age':51,'phone':'•••• 9012','village':'Khera','condition':'Follow-up due','identity_status':'PENDING','last_visit':'Yesterday'}, {'patient_id':'SH-2043','name':'Meena Sharma','age':25,'phone':'•••• 3350','village':'Ward 4','condition':'Routine care','identity_status':'UNVERIFIED','last_visit':'24 Oct 2026'}]
         for p in samples: p.update(version=1,field_versions={k:1 for k in p if k not in {'version','field_versions'}},updated_at=UTC()); db.patients.insert_one(p)
@@ -44,7 +51,16 @@ async def lifespan(app):
     init_db(); bootstrap(); yield; client.close()
 app=FastAPI(title='SAHAAY API',version='3.0.0',lifespan=lifespan)
 origins=[x.strip() for x in settings.cors_origins.split(',') if x.strip()]
-app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=False,allow_methods=['GET','POST','OPTIONS'],allow_headers=['Authorization','Content-Type'])
+
+@app.middleware('http')
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    if request.url.path.startswith('/api/'): response.headers['Cache-Control'] = 'no-store'  # no PHI in shared caches
+    return response
 
 @app.get('/health')
 def health():
@@ -58,16 +74,22 @@ def register(body:RegisterIn):
     try: result=db.users.insert_one(doc)
     except DuplicateKeyError: raise HTTPException(409,'Email already registered')
     doc['_id']=result.inserted_id
-    return {'access_token':create_token(doc),'token_type':'bearer','user':{'name':doc['name'],'email':doc['email'],'role':doc['role']}}
+    return {'access_token':create_token(doc),'token_type':'bearer','user':public_user(doc)}
 
 @app.post('/api/auth/login')
-def login(body:LoginIn):
+def login(body:LoginIn,request:Request):
+    key=f"{request.client.host if request.client else 'unknown'}|{body.email.lower()}"
+    if login_limiter.blocked(key): raise HTTPException(429,'Too many failed sign-in attempts. Wait a few minutes and try again.',headers={'Retry-After':'300'})
     user=db.users.find_one({'email':body.email.lower(),'active':True})
-    if not user or not verify_password(body.password,user['password_hash']): raise HTTPException(401,'Incorrect email or password')
-    return {'access_token':create_token(user),'token_type':'bearer','user':{'name':user['name'],'email':user['email'],'role':user['role']}}
+    # Same message and similar work whether the account exists or not (no account enumeration).
+    valid=verify_password(body.password,user['password_hash']) if user else (verify_password(body.password,_DUMMY_HASH) and False)
+    if not valid:
+        login_limiter.record_failure(key); raise HTTPException(401,'Incorrect email or password')
+    login_limiter.reset(key)
+    return {'access_token':create_token(user),'token_type':'bearer','user':public_user(user)}
 
 @app.get('/api/auth/me')
-def me(user=Depends(current_user)): return {'name':user['name'],'email':user['email'],'role':user['role']}
+def me(user=Depends(current_user)): return public_user(user)
 
 @app.post('/api/admin/users',status_code=201)
 def provision_user(body:RegisterIn,user=Depends(require_roles('supervisor'))):
@@ -104,6 +126,8 @@ def get_patient(patient_id:str,user=Depends(require_roles('worker','supervisor',
 def sync_batch(body:BatchIn,user=Depends(require_roles('worker','supervisor','clinician'))):
     results=[]
     for op in body.operations:
+        problem=operation_problem(op)
+        if problem: results.append({'operation_id':op.operation_id,'status':'rejected','reason':problem}); continue
         if not op.changes: results.append({'operation_id':op.operation_id,'status':'rejected','reason':'empty_changes'}); continue
         is_create=bool(op.changes.get('__create__'))
         incoming_changes={k:v for k,v in op.changes.items() if k!='__create__'}
@@ -238,11 +262,11 @@ def review_evidence(conflict_id:str,evidence_reference:str,decision:str,review_n
     return {'evidence_reference':evidence_reference,'status':status,'note':'Approval records a reviewer decision; it is not cryptographic document authentication.'}
 
 @app.post('/api/identity/{patient_id}/attempt')
-def identity_attempt(patient_id:str,body:dict,user=Depends(require_roles('worker','supervisor'))):
-    if not body.get('consent'): raise HTTPException(400,'Recorded consent is required')
+def identity_attempt(patient_id:str,body:IdentityAttemptIn,user=Depends(require_roles('worker','supervisor'))):
+    if not body.consent: raise HTTPException(400,'Recorded consent is required')
     if not db.patients.find_one({'patient_id':patient_id}): raise HTTPException(404,'Patient not found')
     # Do not accept/store raw QR payloads, XML files, Aadhaar numbers or share phrases.
-    safe={'patient_id':patient_id,'method':body.get('method'),'status':'PENDING_AUTHENTIC_VERIFICATION','consent_recorded':True,'created_by':str(user['_id']),'created_at':UTC(),'note':'Credential authenticity and holder match are not verified by this endpoint.'}
+    safe={'patient_id':patient_id,'method':body.method,'status':'PENDING_AUTHENTIC_VERIFICATION','consent_recorded':True,'created_by':str(user['_id']),'created_at':UTC(),'note':'Credential authenticity and holder match are not verified by this endpoint.'}
     db.identity_attempts.insert_one(safe); audit(patient_id,user,'IDENTITY_ATTEMPT_RECORDED','Identity attempt recorded',{'method':safe['method']})
     return {'status':safe['status'],'note':safe['note']}
 
@@ -255,9 +279,8 @@ def dashboard(user=Depends(require_roles('worker','supervisor','clinician'))):
     return {'patients':db.patients.count_documents({}),'pending_conflicts':db.conflicts.count_documents({'status':'pending'}),'pending_operations':db.operations.count_documents({'status':{'$in':['pending','retryable_error']}}),'identity_pending':db.identity_attempts.count_documents({'status':'PENDING_AUTHENTIC_VERIFICATION'}),'recent_audit':db.audit.count_documents({})}
 
 @app.post('/api/chatbot/message')
-def chatbot(body:dict,user=Depends(current_user)):
-    question=str(body.get('message','')).strip()
-    if not question or len(question)>2000: raise HTTPException(400,'Message must be 1–2000 characters')
+def chatbot(body:ChatIn,user=Depends(current_user)):
+    question=body.message
     if not settings.groq_api_key: raise HTTPException(503,'Chatbot is not configured. Add GROQ_API_KEY to backend .env')
     import httpx
     system='You are SAHAAY, a general health-information assistant. Explain medical terms and general precautions in plain language. Do not diagnose, prescribe, recommend medication/dose changes, interpret a person-specific record, or replace a clinician. For potentially urgent symptoms, advise contacting local emergency services or urgent medical care. Do not request Aadhaar or identifying information. If asked for a diagnosis or treatment decision, explain the limitation and suggest a qualified clinician.'

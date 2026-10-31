@@ -91,7 +91,7 @@ Legend: **Full** fully implemented · **Partial** · **FE** frontend only · **B
 |---|---|---|
 | 0 | Audit + documentation | **Done** (this document set) |
 | 1 | Consolidate repo (frontend + backend) | **Done** 2026-11-01 — see TEST_REPORT_M1.md. Atlas run pending (blocker) |
-| 2 | Backend correctness & security | Not started |
+| 2 | Security & auth (part of backend correctness) | **Done 2026-11-01** (code-only; Atlas-dependent verification **blocked**). Sync/transaction fixes (S1–S4) deferred to next milestone |
 | 3 | Conflict engine | Not started |
 | 4 | Offline sync rework | Not started |
 | 5 | Frontend workflows (all 4 roles) | Not started |
@@ -108,3 +108,8 @@ Legend: **Full** fully implemented · **Partial** · **FE** frontend only · **B
 - **Blocked:** Atlas connection (backend can't start; transactions/idempotency/auth E2E untested). Groq key deferred.
 - **No behaviour changes to source yet** apart from file moves, new tests/config, `.env.example` and `.gitignore`.
 - Auth/token-storage evaluation written: `AUTH_OPTIONS.md` (awaiting your decision).
+
+## Milestone 2 result (2026-11-01) — see TEST_REPORT_M2.md
+Done: strong-secret enforcement, no default supervisor password, seeding off by default, short-lived tokens, sessionStorage token, structured 401s, rate-limited login, typed/validated inputs, security headers, strict CORS; frontend: per-user local data isolation (device owner lock), op ownership tagging, logout with unsynced-change confirmation, soft session expiry; dependency audit (critical/high removed); 59 backend + 24 frontend tests passing, build passing.
+Not done / blocked: anything needing Atlas; refresh tokens; login audit log; browser verification of new dialogs; CSP header; sync correctness bugs S1–S4 (reproduced, still failing as expected).
+Changes to existing behaviour to be aware of: tokens now expire after 60 min (was 12 h); first supervisor needs a real-domain email and a strong password in `.env` or the backend refuses to start; the frontend no longer shows local fake demo patients unless `VITE_SEED_DEMO_DATA=true`; `/api/auth/*` user objects now include `id`.
