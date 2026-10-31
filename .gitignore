@@ -1,5 +1,18 @@
+# secrets / local config
 .env
+.env.*
+!.env.example
+# python
 .venv/
+venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+# node
+node_modules/
+dist/
+dev-dist/
+# editor / os
+.vscode/
+*.code-workspace
+Thumbs.db

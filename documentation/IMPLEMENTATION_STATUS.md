@@ -90,7 +90,7 @@ Legend: **Full** fully implemented · **Partial** · **FE** frontend only · **B
 | # | Milestone | Status |
 |---|---|---|
 | 0 | Audit + documentation | **Done** (this document set) |
-| 1 | Consolidate repo (frontend + backend) | Not started |
+| 1 | Consolidate repo (frontend + backend) | **Done** 2026-11-01 — see TEST_REPORT_M1.md. Atlas run pending (blocker) |
 | 2 | Backend correctness & security | Not started |
 | 3 | Conflict engine | Not started |
 | 4 | Offline sync rework | Not started |
@@ -100,3 +100,11 @@ Legend: **Full** fully implemented · **Partial** · **FE** frontend only · **B
 | 8 | Automated tests + reports | Not started |
 | 9 | Deployment prep | Not started |
 | 10 | Hackathon material | Not started |
+
+## Milestone 1 result (2026-11-01)
+- Repo restructured (git history kept): `backend/`, `frontend/`, `documentation/`. Integration `App.jsx/api.js/db.js/syncEngine.js` applied on top of the original Vite project (original simulated `App.jsx`/`db.js` kept in `documentation/original-frontend-simulated/`). Original folders in Downloads untouched.
+- Frontend `npm ci` + production build + dev server: passed. Backend deps installed; fails fast without config (expected).
+- Six critical bugs: reproduced by tests (4 backend, 2 frontend); see TEST_REPORT_M1.md.
+- **Blocked:** Atlas connection (backend can't start; transactions/idempotency/auth E2E untested). Groq key deferred.
+- **No behaviour changes to source yet** apart from file moves, new tests/config, `.env.example` and `.gitignore`.
+- Auth/token-storage evaluation written: `AUTH_OPTIONS.md` (awaiting your decision).
