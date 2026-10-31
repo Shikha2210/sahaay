@@ -66,5 +66,35 @@ Transactions; idempotent replay; concurrent resolution; unique indexes; real boo
 
 Mutation checks (code deliberately broken, tests must fail, code restored): removing the queue sort -> 3 failures; hard-coding base_version -> 3 failures; making every field a conflict (writer logic) -> 2 failures.
 
-## Real-Atlas tests: status = BLOCKED (backend/.env not created yet)
+## Real-Atlas tests: superseded - see "Real Atlas results" below (originally BLOCKED)
 Written and ready, **not executed, so no claim is made**: connection+ping+replica-set, patient persistence, unique indexes, idempotent replay, transaction commit atomicity, **real rollback via injected failure**, clinical conflict recorded (no overwrite), **concurrent conflict resolution** (two threads), supervisor denied on clinical conflict, audit persistence. They run only against a throwaway `sahaay_test_<random>` database that is dropped afterwards; the real `sahaay` database is never used. Run: `$env:SAHAAY_ATLAS_TESTS='1'; .\.venv\Scripts\python.exe -m pytest tests/test_atlas_integration.py -v -rs`.
+
+---
+# Real Atlas results (2026-11-01) — REAL MongoDB Atlas, not a simulation
+
+Cluster: Atlas replica set `atlas-in1nsb-shard-0` (transactions supported). Test database: disposable `sahaay_test_<random>`.
+
+## Connectivity
+* An earlier intermittent failure (`SSL handshake failed: TLSV1_ALERT_INTERNAL_ERROR`) was diagnosed as **Atlas Network Access**: the machine's outgoing connections alternated between two public IPs and only some were allowed. DNS, TCP, TLS certificate verification (Let's Encrypt, no interception), OpenSSL 3.0.13 and pymongo 4.13.0 were all fine. TLS verification was never disabled. After both IPs were added: `scripts/check_atlas.py` **5 of 5 PASS**.
+
+## Integration tests: `tests/test_atlas_integration.py` — 10 passed, 0 failed
+| Test | Result | What it proves (real Atlas) |
+|---|---|---|
+| connection, ping, replica set | PASSED | ping ok; replica set present |
+| patient persists | PASSED | create op stored with identity_status=UNVERIFIED, version 1, field writers |
+| unique indexes exist | PASSED | `operation_id` and `patient_id` unique indexes created |
+| idempotent replay | PASSED | same operation twice -> `applied` then `duplicate`; 1 receipt, 1 audit row, version bumped once |
+| transaction commit | PASSED | patient + receipt + change feed + audit all written |
+| **transaction rollback** | PASSED | failure injected at the last write: MongoDB left no patient, receipt or change; same operation then succeeded once |
+| clinical conflict | PASSED | competing write from another device -> conflict recorded, original value kept (no last-write-wins) |
+| **concurrent conflict resolution** | PASSED | two simultaneous resolves: exactly one 200; conflict resolved once, patient version +1, one CONFLICT_RESOLVED audit |
+| supervisor denied on clinical conflict | PASSED | 403, conflict stays pending |
+| audit persistence | PASSED | actor id, role and timestamp stored |
+
+Caveats: authentication was bypassed in these tests (a fake signed-in user is injected); the real HTTP login flow against Atlas, the pull feed, the bootstrap supervisor creation and the browser UI are **not yet tested against Atlas**. The loser of the concurrent-resolve race was only required to fail safely (404/409/503); its exact code was not recorded.
+
+## Safety verification
+Read-only snapshots (collection names + counts) of the real `sahaay` database before and after the test runs were **identical** (database does not exist yet; the cluster holds only Atlas's `sample_mflix`). A first run left its throwaway database behind because the Atlas user lacks the `dropDatabase` privilege; the fixture now falls back to dropping the throwaway database's collections, and that one leftover (8 test patients, ids `SH-T…`) was removed after a name-pattern and content check. No `sahaay_test_*` database remains.
+
+## Other suites at this point
+Backend 79 passed / 10 skipped (Atlas, opt-in) / 2 expected failures (C1, C2); frontend 40 passed.

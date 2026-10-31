@@ -143,3 +143,6 @@ Positive: passwords bcrypt-hashed; JWT validated and user re-loaded from DB on e
 | S15 `rejected` receipt rewritten as `duplicate` | **FIXED** | Replays return `duplicate` only for applied/conflict receipts. |
 | **New (found while fixing)** `.env` was read relative to the current directory | **FIXED** | Config now always reads `backend/.env`. |
 | Residual / still open | OPEN | S5-S9, S11-S14, C1-C11 unchanged. Known limit: a pending conflict's `value_a` can go stale if its own device later overwrites that field (C5). Two devices sharing one `device_id` (same browser profile) are treated as one device by design. |
+
+# Verification on real Atlas (2026-11-01)
+S1, S3, S4 and the idempotency/ordering guarantees now also pass against a real Atlas replica set (see TEST_REPORT_M2.md). Server-side S2 ordering is covered by stand-in tests; the real-Atlas suite covers create/update/conflict flows only. New operational note: **Atlas Network Access must contain every public IP the machine uses** (intermittent `TLSV1_ALERT_INTERNAL_ERROR` otherwise).

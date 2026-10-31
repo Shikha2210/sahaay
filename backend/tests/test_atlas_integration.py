@@ -48,7 +48,13 @@ def real():
     yield client, database
     mp.undo()
     if name.startswith("sahaay_test_"):
-        client.drop_database(name)   # removes only the throwaway database created above
+        try:
+            client.drop_database(name)   # removes only the throwaway database created above
+        except Exception:
+            # Some Atlas database users may not hold the dropDatabase privilege; dropping the throwaway database's
+            # collections one by one removes it just the same (an empty MongoDB database does not exist).
+            for coll in database.list_collection_names():
+                database.drop_collection(coll)
     client.close()
 
 

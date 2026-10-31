@@ -91,7 +91,7 @@ Legend: **Full** fully implemented · **Partial** · **FE** frontend only · **B
 |---|---|---|
 | 0 | Audit + documentation | **Done** (this document set) |
 | 1 | Consolidate repo (frontend + backend) | **Done** 2026-11-01 — see TEST_REPORT_M1.md. Atlas run pending (blocker) |
-| 2b | Sync correctness S1-S4 | **Code done 2026-11-01**, stand-in tested; real Atlas verification BLOCKED until `backend/.env` exists |
+| 2b | Sync correctness S1-S4 | **Done and verified on real Atlas** (10/10 integration tests, 2026-11-01). Not yet tested on Atlas: HTTP login flow, pull feed, bootstrap, browser UI |
 | 2 | Security & auth (part of backend correctness) | **Done 2026-11-01** (code-only; Atlas-dependent verification **blocked**). Sync/transaction fixes (S1–S4) deferred to next milestone |
 | 3 | Conflict engine | Not started |
 | 4 | Offline sync rework | Not started |
@@ -120,3 +120,8 @@ Changes to existing behaviour to be aware of: tokens now expire after 60 min (wa
 * Preserved: persistent queue, retry/back-off, idempotency, owner tagging, no-LWW for clinical fields.
 * Tooling added: `backend/scripts/setup_env.ps1` (hidden-input .env setup) and `backend/scripts/check_atlas.py` (read-only ping). **Neither has been run against Atlas yet.**
 * Blocked: all real-database verification until the user runs `setup_env.ps1`.
+
+## Atlas verification (2026-11-01)
+* `backend/.env` created via `scripts/setup_env.ps1` (git-ignored). `check_atlas.py` 5/5 PASS after the two public IPs were added to Atlas Network Access (earlier `TLSV1_ALERT_INTERNAL_ERROR` = IP allow-list).
+* Real-Atlas integration tests: **10 passed**: persistence, idempotent replay, transaction commit, real rollback, no-LWW conflict, concurrent resolution (exactly once), role denial, audit persistence. Real `sahaay` database verified untouched.
+* Remaining risk: public IP can change again; any new address must be added to Network Access.
