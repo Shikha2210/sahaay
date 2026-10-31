@@ -44,3 +44,27 @@ Transactions; idempotent replay; concurrent resolution; unique indexes; real boo
 ## Test-quality notes
 * `it.fails`/`xfail(strict)` reproductions were re-verified to fail for the documented reasons after the changes (S2/S3 messages unchanged).
 * Fakes used: `tests/fakes.py` (users lookup), a fake collection for `bootstrap()`, fake-indexeddb, `fetch` test doubles. None of these is evidence about MongoDB or the real network.
+
+---
+# Milestone 2b addendum — sync fixes (S1-S4)
+
+## Results (this machine, no Atlas connection)
+| Suite | Passed | Failed | Skipped | Expected-failure |
+|---|---|---|---|---|
+| Backend pytest | **79** | 0 | **10** (Atlas, opt-in) | 2 (C1, C2 — unrelated open bugs) |
+| Frontend vitest | **40** | 0 | 0 | 0 |
+| Frontend production build | **passed** | | | |
+
+## What each kind of test proves
+| Kind | Tests | Proves | Does NOT prove |
+|---|---|---|---|
+| **Pure logic** | `detect_field_conflicts` (5 tests) | conflict rules, incl. other-device write = conflict | anything about Mongo |
+| **In-memory STAND-IN for MongoDB** (`tests/fakes.py: MemMongo`) | `tests/test_sync_fixes.py` (S1 x4, S2 x4, S3 x4 + merge, S4 x3, idempotency x2) | our sync LOGIC: ordering, blocking, receipts, one-result-per-op, rollback *as a snapshot restore* | real transactions, isolation, rollback, indexes, concurrency |
+| Real endpoints, no DB reached | validation/auth tests | request handling | persistence |
+| Client with fake-indexeddb + `fetch` double | `syncEngine.regression.test.js` (17) | queue ordering, per-patient blocking, base_version, retry, lost-ack resend | the real server |
+| **REAL Atlas** | `tests/test_atlas_integration.py` (10 tests) | **BLOCKED: written, never run** | — |
+
+Mutation checks (code deliberately broken, tests must fail, code restored): removing the queue sort -> 3 failures; hard-coding base_version -> 3 failures; making every field a conflict (writer logic) -> 2 failures.
+
+## Real-Atlas tests: status = BLOCKED (backend/.env not created yet)
+Written and ready, **not executed, so no claim is made**: connection+ping+replica-set, patient persistence, unique indexes, idempotent replay, transaction commit atomicity, **real rollback via injected failure**, clinical conflict recorded (no overwrite), **concurrent conflict resolution** (two threads), supervisor denied on clinical conflict, audit persistence. They run only against a throwaway `sahaay_test_<random>` database that is dropped afterwards; the real `sahaay` database is never used. Run: `$env:SAHAAY_ATLAS_TESTS='1'; .\.venv\Scripts\python.exe -m pytest tests/test_atlas_integration.py -v -rs`.

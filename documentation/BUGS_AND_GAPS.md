@@ -130,3 +130,16 @@ Positive: passwords bcrypt-hashed; JWT validated and user re-loaded from DB on e
 | **X14 (new)** Idle/unattended device shows cached PHI after token expiry (soft-expiry design) | **OPEN (documented trade-off)** | Consider idle auto-lock (Milestone 6/7). |
 | **X15 (new)** IndexedDB data is unencrypted | **OPEN** | Out of scope for the prototype; document in pitch. |
 | **X16 (new)** No Content-Security-Policy; third-party Google Fonts import | **OPEN → Milestone 9** | Set CSP header on the static host; self-host fonts. |
+
+---
+# Status after Milestone 2b (sync correctness)
+
+| ID | Status | Fix / evidence |
+|---|---|---|
+| **S1** offline patient create rejected (`identity_status`) | **FIXED (logic-tested with an in-memory stand-in; real Atlas run pending)** | `identity_status` is accepted on create ONLY and ONLY as `UNVERIFIED`; `VERIFIED` (or any change via an update op) is rejected, so sync can never mark anyone verified. Defaults to UNVERIFIED. |
+| **S2** random operation order | **FIXED** | Client: per-device sequence number (`seq`) orders the queue (clock-skew proof; legacy ops fall back to time); an op is never sent ahead of an earlier op for the same patient that is waiting for retry or whose create was rejected. Server: batch processed strictly in order; after a failure, later ops for that patient return `blocked_by_earlier_operation` (kept pending, no back-off penalty). `patient_not_found` no longer stores a permanent receipt, so the same operation can succeed once its create arrives. |
+| **S3** false self-conflicts | **FIXED (logic-tested; real Atlas run pending)** | Server records the last writer device per field (`field_writers`). A field changed after `base_version` is a conflict UNLESS the same device wrote it last; another device's write is ALWAYS a conflict (no last-write-wins for clinical data; covered by test). Client `base_version` now defaults to the local patient's version (0 for new patients) instead of a hard-coded 1. |
+| **S4** failed commit reported as applied | **FIXED (simulated commit failure; real Atlas rollback test pending)** | Each operation runs in `session.with_transaction(...)` (driver retries transient errors) and a result is built only after commit. Exactly one result per operation; commit failure or mid-transaction error -> `retryable_error`, nothing persisted, same op_id succeeds once on retry. |
+| S15 `rejected` receipt rewritten as `duplicate` | **FIXED** | Replays return `duplicate` only for applied/conflict receipts. |
+| **New (found while fixing)** `.env` was read relative to the current directory | **FIXED** | Config now always reads `backend/.env`. |
+| Residual / still open | OPEN | S5-S9, S11-S14, C1-C11 unchanged. Known limit: a pending conflict's `value_a` can go stale if its own device later overwrites that field (C5). Two devices sharing one `device_id` (same browser profile) are treated as one device by design. |

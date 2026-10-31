@@ -1,6 +1,10 @@
 import re
+from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Always backend/.env, no matter which folder the server is started from.
+ENV_FILE = Path(__file__).resolve().parent.parent / '.env'
 
 # Values that must never be accepted as secrets/passwords (placeholders and the old built-in default).
 _PLACEHOLDER_MARKERS = ('replace', 'changeme', 'change_me', 'changethis', 'example', 'your_secret', 'yoursecret',
@@ -62,7 +66,7 @@ class Settings(BaseSettings):
     # No default: only needed when no supervisor exists yet. Validated when used (see bootstrap()).
     bootstrap_supervisor_password: str = Field(default='', alias='BOOTSTRAP_SUPERVISOR_PASSWORD')
     seed_demo_data: bool = Field(default=False, alias='SEED_DEMO_DATA')
-    model_config = SettingsConfigDict(env_file='.env', extra='ignore', populate_by_name=True)
+    model_config = SettingsConfigDict(env_file=str(ENV_FILE), extra='ignore', populate_by_name=True)
 
     @field_validator('jwt_secret')
     @classmethod

@@ -122,60 +122,128 @@ def get_patient(patient_id:str,user=Depends(require_roles('worker','supervisor',
     if not p: raise HTTPException(404,'Patient not found')
     return clean(p)
 
+# identity_status may be sent ONLY when creating a patient and ONLY as UNVERIFIED. Sync can never mark anyone VERIFIED.
+CREATE_ONLY_FIELDS={'identity_status'}
+
+
+class RetryableConflict(Exception):
+    """The patient record changed under us inside the transaction; the client should retry the operation."""
+
+
+def detect_field_conflicts(patient, incoming, base_version, device_id):
+    """Field-level optimistic concurrency (pure function, no database access).
+
+    A field is a CONFLICT when it was changed on the server after the version the client based its edit on,
+    UNLESS the last writer of that field is the same device (the device's own earlier operation, e.g. two
+    sequential edits made offline). A newer write by anyone else is always a conflict: clinical data is never
+    resolved by last-write-wins. Returns (updates, conflicting) where conflicting maps field -> current value.
+    """
+    versions=patient.get('field_versions',{}); writers=patient.get('field_writers',{})
+    updates={}; conflicting={}
+    for field,value in incoming.items():
+        current=patient.get(field)
+        if current==value: continue
+        changed_since_base=int(versions.get(field,1))>base_version
+        if changed_since_base and writers.get(field)!=device_id: conflicting[field]=current
+        else: updates[field]=value
+    return updates,conflicting
+
+
+def _replay(response):
+    """Answer for an operation_id that was already processed (idempotency)."""
+    return {**response,'status':'duplicate'} if response.get('status') in ('applied','conflict') else response
+
+
+def _precheck(op):
+    """Validation that needs no database. Returns a rejection response or None."""
+    def rejected(reason,**extra): return {'operation_id':op.operation_id,'patient_id':op.patient_id,'status':'rejected','reason':reason,**extra}
+    problem=operation_problem(op)
+    if problem: return rejected(problem)
+    if not op.changes: return rejected('empty_changes')
+    is_create=bool(op.changes.get('__create__'))
+    incoming={k:v for k,v in op.changes.items() if k!='__create__'}
+    if not incoming: return rejected('empty_changes')
+    allowed=SAFE_FIELDS|(CREATE_ONLY_FIELDS if is_create else set())
+    unknown=set(incoming)-allowed
+    if unknown: return rejected('unsupported_fields',fields=sorted(unknown))
+    if incoming.get('identity_status','UNVERIFIED')!='UNVERIFIED': return rejected('identity_status_not_allowed')
+    return None
+
+
+def apply_operation(op, user, session):
+    """Apply ONE sync operation. Runs inside a MongoDB transaction (session.with_transaction), which may re-run it after a
+    transient error - so it has no side effects outside the transaction and builds its response only from committed-or-
+    rolled-back work. The caller must not report the result until the transaction has committed."""
+    existing=db.operations.find_one({'operation_id':op.operation_id},session=session)
+    if existing: return _replay(existing['response'])
+    is_create=bool(op.changes.get('__create__'))
+    incoming={k:v for k,v in op.changes.items() if k!='__create__'}
+    patient=db.patients.find_one({'patient_id':op.patient_id},session=session)
+    now=UTC()
+    def receipt(response):
+        db.operations.insert_one({'operation_id':op.operation_id,'patient_id':op.patient_id,'device_id':op.device_id,'actor_id':str(user['_id']),'base_version':op.base_version,'changes':op.changes,'status':response['status'],'response':response,'created_at':now},session=session)
+    if not patient and is_create:
+        doc=dict(incoming); doc.setdefault('identity_status','UNVERIFIED')
+        doc.update({'patient_id':op.patient_id,'version':1,'field_versions':{k:1 for k in incoming},'field_writers':{k:op.device_id for k in incoming},'created_at':now,'updated_at':now,'created_by':str(user['_id'])})
+        db.patients.insert_one(doc,session=session)
+        seq=next_seq(session); db.changes.insert_one({'seq':seq,'patient_id':op.patient_id,'version':1,'changes':incoming,'operation_id':op.operation_id,'created_at':now},session=session)
+        response={'operation_id':op.operation_id,'patient_id':op.patient_id,'status':'applied','server_version':1,'applied_fields':list(incoming),'conflicts':[]}
+        receipt(response)
+        db.audit.insert_one({'patient_id':op.patient_id,'actor_id':str(user['_id']),'actor_role':user['role'],'event_type':'PATIENT_CREATED_SYNC','description':'Patient created through offline sync','metadata':{},'created_at':now},session=session)
+        return response
+    if not patient:
+        # No receipt is stored: the operation may become valid later (e.g. its create arrives), and a stored
+        # rejection would permanently poison this operation_id.
+        return {'operation_id':op.operation_id,'patient_id':op.patient_id,'status':'rejected','reason':'patient_not_found','conflicts':[]}
+    updates,conflicting=detect_field_conflicts(patient,incoming,op.base_version,op.device_id)
+    conflicts=[]
+    for field,current in conflicting.items():
+        cid='CF-'+uuid.uuid4().hex[:12].upper(); cat=category(field)
+        db.conflicts.insert_one({'conflict_id':cid,'operation_id':op.operation_id,'patient_id':op.patient_id,'field':field,'category':cat,'value_a':current,'value_b':incoming[field],'base_version':op.base_version,'server_version':patient.get('version',1),'status':'pending','created_at':now,'actor_id':str(user['_id']),'device_id':op.device_id},session=session)
+        conflicts.append({'conflict_id':cid,'field':field,'category':cat})
+    new_version=patient.get('version',1)
+    if updates:
+        new_version+=1
+        set_doc={k:v for k,v in updates.items()}
+        set_doc.update({f'field_versions.{k}':new_version for k in updates}); set_doc.update({f'field_writers.{k}':op.device_id for k in updates})
+        set_doc.update({'version':new_version,'updated_at':now})
+        done=db.patients.update_one({'patient_id':op.patient_id,'version':patient.get('version',1)},{'$set':set_doc},session=session)
+        if done.matched_count!=1: raise RetryableConflict()
+        seq=next_seq(session)
+        db.changes.insert_one({'seq':seq,'patient_id':op.patient_id,'version':new_version,'changes':updates,'operation_id':op.operation_id,'created_at':now},session=session)
+    status='conflict' if conflicts else 'applied'
+    response={'operation_id':op.operation_id,'patient_id':op.patient_id,'status':status,'server_version':new_version,'applied_fields':list(updates),'conflicts':conflicts}
+    receipt(response)
+    db.audit.insert_one({'patient_id':op.patient_id,'actor_id':str(user['_id']),'actor_role':user['role'],'event_type':'SYNC_OPERATION','description':f"{op.operation_id}: {status}",'metadata':{'applied_fields':list(updates),'conflicts':conflicts},'created_at':now},session=session)
+    return response
+
+
 @app.post('/api/sync/batch')
 def sync_batch(body:BatchIn,user=Depends(require_roles('worker','supervisor','clinician'))):
-    results=[]
+    """Operations are processed strictly IN ORDER. Each one is its own transaction. A result is only reported after that
+    transaction has committed. If an operation for a patient fails (or its create is rejected), later operations for the
+    same patient in this batch are held back ('blocked_by_earlier_operation') so they can never be applied out of order."""
+    results=[]; blocked=set()
     for op in body.operations:
-        problem=operation_problem(op)
-        if problem: results.append({'operation_id':op.operation_id,'status':'rejected','reason':problem}); continue
-        if not op.changes: results.append({'operation_id':op.operation_id,'status':'rejected','reason':'empty_changes'}); continue
-        is_create=bool(op.changes.get('__create__'))
-        incoming_changes={k:v for k,v in op.changes.items() if k!='__create__'}
-        unknown=set(incoming_changes)-SAFE_FIELDS
-        if unknown: results.append({'operation_id':op.operation_id,'status':'rejected','reason':'unsupported_fields','fields':sorted(unknown)}); continue
+        def result(status,**extra): return {'operation_id':op.operation_id,'patient_id':op.patient_id,'status':status,**extra}
+        rejected=_precheck(op)
+        if rejected:
+            results.append(rejected)
+            if op.changes.get('__create__'): blocked.add(op.patient_id)
+            continue
+        if op.patient_id in blocked:
+            results.append(result('retryable_error',reason='blocked_by_earlier_operation')); continue
         try:
             with client.start_session() as session:
-                with session.start_transaction():
-                    existing=db.operations.find_one({'operation_id':op.operation_id},session=session)
-                    if existing:
-                        results.append({**existing['response'],'status':'duplicate'}); continue
-                    patient=db.patients.find_one({'patient_id':op.patient_id},session=session)
-                    if not patient and is_create:
-                        seed_fields=dict(incoming_changes); seed_fields.update({'patient_id':op.patient_id,'version':1,'field_versions':{k:1 for k in incoming_changes},'created_at':UTC(),'updated_at':UTC(),'created_by':str(user['_id'])})
-                        db.patients.insert_one(seed_fields,session=session); patient=seed_fields
-                        seq=next_seq(session); db.changes.insert_one({'seq':seq,'patient_id':op.patient_id,'version':1,'changes':incoming_changes,'operation_id':op.operation_id,'created_at':UTC()},session=session)
-                        response={'operation_id':op.operation_id,'patient_id':op.patient_id,'status':'applied','server_version':1,'applied_fields':list(incoming_changes),'conflicts':[]}
-                        db.operations.insert_one({'operation_id':op.operation_id,'patient_id':op.patient_id,'device_id':op.device_id,'actor_id':str(user['_id']),'base_version':op.base_version,'changes':op.changes,'status':'applied','response':response,'created_at':UTC()},session=session)
-                        db.audit.insert_one({'patient_id':op.patient_id,'actor_id':str(user['_id']),'actor_role':user['role'],'event_type':'PATIENT_CREATED_SYNC','description':'Patient created through offline sync','metadata':{},'created_at':UTC()},session=session)
-                        results.append(response); continue
-                    if not patient:
-                        response={'operation_id':op.operation_id,'patient_id':op.patient_id,'status':'rejected','reason':'patient_not_found','conflicts':[]}
-                        db.operations.insert_one({'operation_id':op.operation_id,'patient_id':op.patient_id,'device_id':op.device_id,'actor_id':str(user['_id']),'status':'rejected','response':response,'created_at':UTC()},session=session)
-                        results.append(response); continue
-                    versions=patient.get('field_versions',{}); updates={}; conflicts=[]
-                    for field,incoming in incoming_changes.items():
-                        current=patient.get(field)
-                        if current==incoming: continue
-                        if int(versions.get(field,1))>op.base_version:
-                            cid='CF-'+uuid.uuid4().hex[:12].upper(); cat=category(field)
-                            c={'conflict_id':cid,'operation_id':op.operation_id,'patient_id':op.patient_id,'field':field,'category':cat,'value_a':current,'value_b':incoming,'base_version':op.base_version,'server_version':patient.get('version',1),'status':'pending','created_at':UTC(),'actor_id':str(user['_id']),'device_id':op.device_id}
-                            db.conflicts.insert_one(c,session=session); conflicts.append({'conflict_id':cid,'field':field,'category':cat})
-                        else: updates[field]=incoming
-                    new_version=patient.get('version',1)
-                    if updates:
-                        new_version+=1; set_doc={f'{k}':v for k,v in updates.items()}; set_doc.update({f'field_versions.{k}':new_version for k in updates}); set_doc.update({'version':new_version,'updated_at':UTC()})
-                        db.patients.update_one({'patient_id':op.patient_id,'version':patient.get('version',1)},{'$set':set_doc},session=session)
-                        seq=next_seq(session)
-                        db.changes.insert_one({'seq':seq,'patient_id':op.patient_id,'version':new_version,'changes':updates,'operation_id':op.operation_id,'created_at':UTC()},session=session)
-                    status='conflict' if conflicts else 'applied'
-                    response={'operation_id':op.operation_id,'patient_id':op.patient_id,'status':status,'server_version':new_version,'applied_fields':list(updates),'conflicts':conflicts}
-                    db.operations.insert_one({'operation_id':op.operation_id,'patient_id':op.patient_id,'device_id':op.device_id,'actor_id':str(user['_id']),'base_version':op.base_version,'changes':op.changes,'status':status,'response':response,'created_at':UTC()},session=session)
-                    db.audit.insert_one({'patient_id':op.patient_id,'actor_id':str(user['_id']),'actor_role':user['role'],'event_type':'SYNC_OPERATION','description':f"{op.operation_id}: {status}",'metadata':{'applied_fields':list(updates),'conflicts':conflicts},'created_at':UTC()},session=session)
-                    results.append(response)
+                response=session.with_transaction(lambda s,op=op: apply_operation(op,user,s))
         except DuplicateKeyError:
-            old=db.operations.find_one({'operation_id':op.operation_id}); results.append({**old['response'],'status':'duplicate'} if old else {'operation_id':op.operation_id,'status':'retryable_error'})
-        except PyMongoError as exc:
-            results.append({'operation_id':op.operation_id,'status':'retryable_error','reason':'database_transaction_failed'})
+            old=db.operations.find_one({'operation_id':op.operation_id})
+            response=_replay(old['response']) if old else result('retryable_error',reason='database_transaction_failed')
+        except (PyMongoError,RetryableConflict):
+            response=result('retryable_error',reason='database_transaction_failed')
+        results.append(response)
+        if response['status']=='retryable_error' or (response['status']=='rejected' and response.get('reason')=='patient_not_found'):
+            blocked.add(op.patient_id)
     return {'results':results,'server_time':UTC()}
 
 @app.get('/api/sync/pull')

@@ -80,3 +80,6 @@ Move/delete folders (M1), change token storage (M6), drop collections/migrate ex
 * **M2b (next, needs Atlas for real verification):** S1 (create op), S2 (ordered queue), S3 (base_version), S4 (commit-failure result), S15, S14, patient-ID collisions (S8); flip the six reproduction tests to normal tests as each is fixed; first real-Mongo test run (idempotency, transaction, concurrency).
 * Moved: login success/failure audit log → M2b (needs DB); CSP header + self-hosted fonts → M9; idle auto-lock → M7.
 * **Need from you before M2b can be verified:** Atlas M0 + `backend/.env` (`MONGODB_URI`, `JWT_SECRET` from `python -c "import secrets; print(secrets.token_urlsafe(48))"`, `BOOTSTRAP_SUPERVISOR_EMAIL` with a real-looking domain, `BOOTSTRAP_SUPERVISOR_PASSWORD` of your choosing). Code-only work on S1–S4 can still start without it.
+
+## Update after M2b
+* S1-S4 code complete. Next: run `tests/test_atlas_integration.py` against Atlas (needs `backend/.env`), fix whatever it reveals, then Milestone 3 (conflict engine: C1 patient confirmation, C2/C3 resolve flow) only when approved.
