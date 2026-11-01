@@ -4,6 +4,7 @@
 import React, { useEffect, useState } from 'react';
 import { ArrowRight, ArrowUpRight, ShieldCheck, AlertTriangle } from 'lucide-react';
 import { api } from './api';
+import { AiExplain, AiRecordSummary } from './AiParts';
 
 const RESOLUTIONS = ['apply_evidence', 'apply_confirmation', 'accept_current', 'accept_incoming', 'custom', 'reject_incoming'];
 export const SENT_RESOLUTIONS = RESOLUTIONS;   // used by a contract test: every value this screen can send must exist on the server
@@ -109,6 +110,9 @@ export function ConflictDialog({ id, role, onClose, onChanged, notify, Modal, Ba
         <label>Reason (required)<input value={note} onChange={e => setNote(e.target.value)} placeholder="Why is the incoming value not accepted?" /></label>
         <button className="outline-btn" disabled={busy || note.trim().length < 3} onClick={() => confirmThen('Reject the incoming change and keep the current value?', () => post('/api/conflicts/' + encodeURIComponent(id) + '/resolve', { resolution: 'reject_incoming', note }), 'Incoming change rejected; current value kept.')}>Reject incoming change</button>
       </section>}
+
+      <AiExplain conflictId={id} />
+      {role === 'clinician' && <AiRecordSummary patientId={d.patient_id} audience="clinician" />}
 
       {d.history && d.history.length > 0 && <section><b>History</b>{d.history.map((h, i) => <div key={i} style={{ fontSize: 11, opacity: .85 }}>{new Date(h.at).toLocaleString()} · {h.actor_role} · {h.action}{h.new_value !== undefined ? ` → ${show(h.new_value)}` : ''}</div>)}</section>}
     </div>;

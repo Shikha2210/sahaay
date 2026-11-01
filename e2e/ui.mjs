@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
+export const here = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(here, '..');
 export const BASE = 'http://localhost:5173';
 export const API = 'http://127.0.0.1:8000';

@@ -161,7 +161,8 @@ await section('clinician: dashboard, evidence review, resolution, history', asyn
   const dash = await content(page);
   R.check('dashboard: real counts - 1 clinical conflict, 1 evidence item, 4 open', /Clinical conflicts.*\b1\b/.test(await metric(page, 'Clinical conflicts')) && /Evidence to review.*\b1\b/.test(await metric(page, 'Evidence to review')) && /Total open.*\b4\b/.test(await metric(page, 'Total open')));
   R.check('dashboard is the clinician\'s own (not the supervisor page) and has no demo content', /AUTHORIZED CLINICIAN/i.test(dash) && !/PROFESSIONAL SUPERVISOR/i.test(dash) && noFake(dash).length === 0);
-  R.check('bell shows 5 (4 conflicts + 1 evidence item)', (await bell(page)) === '5');
+  const bellOk = await waitFor(async () => (await bell(page)) === '5', 10000, 300);   // the count arrives from an asynchronous fetch after sign-in
+  R.check('bell shows 5 (4 conflicts + 1 evidence item)', !!bellOk, `bell="${await bell(page)}"`);
   await shot(page, 'm4_clinician_dashboard');
   await goNav(page, 'Evidence review'); await sleep(1200);
   const q = await content(page);

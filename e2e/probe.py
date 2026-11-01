@@ -49,6 +49,14 @@ elif cmd == "account":
     u = db.users.find_one({"email": args[0]}) or {}
     ic = u.get("identity_check") or {}
     print(json.dumps({"linked_patient_id": u.get("linked_patient_id"), "method": ic.get("method"), "checked_by_supervisor": bool(ic.get("checked_by")), "has_note": bool(ic.get("note")), "linked_by": bool(u.get("linked_by"))}))
+elif cmd == "ai_audit":
+    print(json.dumps([{"actor_role": a["actor_role"], "metadata": a["metadata"]} for a in db.audit.find({"patient_id": args[0], "event_type": "AI_ASSIST"}).sort("created_at", 1)]))
+elif cmd == "scan":
+    needle = args[0]; hits = {}
+    for n in db.list_collection_names():
+        k = sum(1 for d in db[n].find({}) if needle in json.dumps(d, default=str))
+        if k: hits[n] = k
+    print(json.dumps(hits))
 elif cmd == "counts":
     print(json.dumps({n: db[n].count_documents({}) for n in ("users", "patients", "operations", "changes", "conflicts", "audit", "evidence", "patient_confirmations")}))
 c.close()

@@ -5,6 +5,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { ArrowRight, Info, ShieldCheck } from 'lucide-react';
 import { api } from './api';
+import { AiExplain } from './AiParts';
 import { label, show, fmtDate, CATEGORY_LABEL } from './fieldLabels';
 
 export default function WorkerConflicts({ notify, onChanged, ui }) {
@@ -31,6 +32,7 @@ export default function WorkerConflicts({ notify, onChanged, ui }) {
         <p>Record had {show(c.value_a)} <ArrowRight size={13} /> your change {show(c.value_b)}{c.status === 'pending' && c.current_value !== c.value_a ? <> · now {show(c.current_value)}</> : null}</p>
         {c.status !== 'pending' && <p><span><b>{c.status === 'resolved' ? `Outcome: record now shows ${show(c.selected_value)}` : 'Outcome: your change was not applied'}</b> · {fmtDate(c.resolved_at)}</span></p>}
         {c.evidence.length > 0 && <div style={{ fontSize: 12, marginTop: 6 }}>{c.evidence.map(e => <div key={e.evidence_reference}>Evidence <b>{e.evidence_reference}</b>: {e.status === 'pending_review' ? 'waiting for clinician review' : e.status}{e.status === 'approved' ? ` (approved value ${show(e.approved_value)})` : ''}{e.review_note ? ` - ${e.review_note}` : ''}</div>)}</div>}
+        <AiExplain conflictId={c.conflict_id} />
         {c.status === 'pending' && c.category !== 'DOCUMENT_VERIFIABLE' && <small>{c.category === 'PATIENT_VERIFIABLE' ? 'The patient is asked to confirm the correct value.' : 'An authorized clinician will review this.'}</small>}
       </div>
       {c.can_submit_evidence && <button className="outline-btn" onClick={() => setForm({ c, reference: '', description: '', claimed: '', error: '', busy: false })}>Submit evidence</button>}

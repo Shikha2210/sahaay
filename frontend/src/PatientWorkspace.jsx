@@ -4,6 +4,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { CalendarDays, FileText, HeartPulse, Info, ShieldCheck, ArrowUpRight } from 'lucide-react';
 import { api } from './api';
+import { AiExplain } from './AiParts';
 import { label, show, fmtDate, greeting } from './fieldLabels';
 
 const RECORD_FIELDS = ['name', 'age', 'phone', 'village', 'condition', 'diagnosis', 'medications', 'allergies', 'treatment_plan', 'blood_pressure', 'blood_glucose', 'dosage', 'last_visit'];
@@ -68,6 +69,7 @@ export default function PatientWorkspace({ mode, setPage, notify, onChanged, ui 
           ? <p><span>You confirmed <b>{show(c.my_confirmation.confirmed_value)}</b>. Your care team will apply it; your record does not change until they do.</span></p>
           : <>
             <p>Two different values are on file. Choose the one that is correct for you.</p>
+            <AiExplain conflictId={c.conflict_id} />
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 }}>
               {[c.value_a, c.value_b].map((v, i) => <button key={i} className="outline-btn" disabled={busy} onClick={() => { setErr(''); setAsk({ c, value: v }); }}>{i === 0 ? 'Currently on file: ' : 'Also reported: '}<b>{show(v)}</b></button>)}
             </div>

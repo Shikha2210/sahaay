@@ -8,7 +8,8 @@ from pymongo import ReturnDocument
 from bson import ObjectId
 from app.config import settings
 from app.db import client, db, init_db
-from app.schemas import RegisterIn, LoginIn, PatientIn, BatchIn, ResolveIn, IdentityAttemptIn, ChatIn, operation_problem, validate_change_values, EvidenceSubmitIn, EvidenceReviewIn, ConfirmIn, LinkAccountIn
+from app import ai
+from app.schemas import RegisterIn, LoginIn, PatientIn, BatchIn, ResolveIn, IdentityAttemptIn, ChatIn, SummaryIn, ExplainIn, operation_problem, validate_change_values, EvidenceSubmitIn, EvidenceReviewIn, ConfirmIn, LinkAccountIn
 from app.security import hash_password, verify_password, create_token, current_user, require_roles, public_user, login_limiter
 from app.config import validate_bootstrap_password, validate_bootstrap_email
 
@@ -551,15 +552,91 @@ def audit_list(limit:int=Query(default=100,ge=1,le=500),user=Depends(require_rol
 def dashboard(user=Depends(require_roles('worker','supervisor','clinician'))):
     return {'patients':db.patients.count_documents({}),'pending_conflicts':db.conflicts.count_documents({'status':'pending'}),'pending_operations':db.operations.count_documents({'status':{'$in':['pending','retryable_error']}}),'identity_pending':db.identity_attempts.count_documents({'status':'PENDING_AUTHENTIC_VERIFICATION'}),'recent_audit':db.audit.count_documents({})}
 
+# =====================================================================================================================
+# AI ASSISTANCE (Milestone 5). Logic and safety rules: app/ai.py. The AI only produces TEXT: nothing here can approve, reject or resolve
+# a conflict, and no user input or AI output is stored. Details sent to the external service are minimal (see ai.py).
+# =====================================================================================================================
+def ai_fail(e):
+    headers={'Retry-After':str(e.extra['retry_after_seconds'])} if e.extra.get('retry_after_seconds') else None
+    raise HTTPException(e.status,{'code':e.code,'message':e.message,**e.extra},headers=headers)
+def ai_language(lang):
+    if lang not in ai.LANGUAGES: fail(422,'unsupported_language','That language is not supported.',supported=sorted(ai.LANGUAGES))
+    return lang
+def ai_ready(user):
+    """Configured + within rate limits, checked BEFORE any data is prepared for sending."""
+    try:
+        if not ai.configured(): raise ai.AiError(503,'ai_not_configured','The AI assistant is not set up on this server yet.')
+        ai.check_rate(user['_id'])
+    except ai.AiError as e: ai_fail(e)
+def ai_call(messages,max_tokens=500):
+    try: return ai.groq_chat(messages,max_tokens=max_tokens)
+    except ai.AiError as e: ai_fail(e)
+
+@app.get('/api/ai/status')
+def ai_status(user=Depends(current_user)):
+    return {'configured':ai.configured(),'languages':{k:v for k,v in ai.LANGUAGES.items() if k!='auto'},'rate_limit_per_minute':settings.ai_rate_per_minute,'disclaimer':ai.DISCLAIMER}
+
 @app.post('/api/chatbot/message')
 def chatbot(body:ChatIn,user=Depends(current_user)):
-    question=body.message
-    if not settings.groq_api_key: raise HTTPException(503,'Chatbot is not configured. Add GROQ_API_KEY to backend .env')
-    import httpx
-    system='You are SAHAAY, a general health-information assistant. Explain medical terms and general precautions in plain language. Do not diagnose, prescribe, recommend medication/dose changes, interpret a person-specific record, or replace a clinician. For potentially urgent symptoms, advise contacting local emergency services or urgent medical care. Do not request Aadhaar or identifying information. If asked for a diagnosis or treatment decision, explain the limitation and suggest a qualified clinician.'
-    try:
-        response=httpx.post('https://api.groq.com/openai/v1/chat/completions',headers={'Authorization':f'Bearer {settings.groq_api_key}'},json={'model':settings.groq_model,'messages':[{'role':'system','content':system},{'role':'user','content':question}],'temperature':0.3,'max_tokens':500},timeout=30)
-        response.raise_for_status(); answer=response.json()['choices'][0]['message']['content']
-    except Exception: raise HTTPException(502,'The AI assistant is temporarily unavailable')
-    db.chat_messages.insert_one({'user_id':str(user['_id']),'question':question,'answer':answer,'created_at':UTC()})
-    return {'answer':answer}
+    """General health information for any signed-in user. No patient data is ever attached. Identifiers the user types are removed
+    before sending; emergencies get a fixed message without calling the AI; nothing is stored."""
+    lang=ai_language(body.language)
+    clean,counts=ai.redact(body.message)
+    if ai.is_emergency(body.message): return {'answer':ai.EMERGENCY_TEXT,'language':lang,'source':'safety','emergency':True,'redactions':counts,'guarded':False,'disclaimer':ai.DISCLAIMER}
+    ai_ready(user)
+    history=[{'role':t.role,'text':t.text} for t in body.history]
+    answer=ai_call(ai.build_chat_messages(clean,history,lang))
+    answer,flagged=ai.guard_output(answer)
+    return {'answer':answer,'language':lang,'source':'ai','emergency':False,'redactions':counts,'guarded':flagged,'disclaimer':ai.DISCLAIMER}
+
+@app.post('/api/ai/patient-summary')
+def ai_patient_summary(body:SummaryIn,user=Depends(require_roles('patient','clinician'))):
+    """Plain-language summary of one patient's record. Patients: their OWN record only. Clinicians: a record they name. Requires explicit
+    consent; sends only an age range and clinical fields (never name, phone, village, ID); the sharing is audited before anything is sent."""
+    lang=ai_language(body.language)
+    if not body.acknowledge_external_ai: fail(422,'consent_required','Please confirm that you agree to send these details to an external AI service.')
+    if user['role']=='patient':
+        pid=user.get('linked_patient_id')
+        if not pid: fail(409,'account_not_linked','Your account is not linked to a health record yet.')
+        if body.patient_id and body.patient_id!=pid: fail(403,'not_your_record','You can only summarise your own record.')
+    else:
+        pid=body.patient_id
+        if not pid: fail(422,'patient_id_required','Choose the patient record to summarise.')
+    patient=db.patients.find_one({'patient_id':pid})
+    if not patient: fail(404,'patient_not_found','Patient record not found.')
+    facts=ai.minimal_record_facts(patient)
+    if not facts['has_clinical']: return {'summary':None,'source':'none','message':'This record has no clinical details to summarise yet.','fields_shared':[],'language':lang}
+    ai_ready(user)
+    try: audit(pid,user,'AI_ASSIST','Record details shared with an external AI service for a summary',{'mode':'patient_summary','fields_shared':facts['fields_shared'],'language':lang})
+    except PyMongoError: fail(503,'audit_unavailable','The sharing could not be recorded, so nothing was sent. Please try again.')
+    aud='patient' if user['role']=='patient' else 'clinician'
+    text=ai_call([{'role':'system','content':ai.SUMMARY_SYSTEM.format(audience=aud,audience_short=aud)+ai.language_line(lang)},
+                  {'role':'user','content':'Facts from the record:\n'+'\n'.join(f'- {k}: {v}' for k,v in facts['items'])}],max_tokens=600)
+    text,flagged=ai.guard_output(text,strict=False)
+    return {'summary':text,'language':lang,'source':'ai','fields_shared':facts['fields_shared'],'redactions':facts['redactions'],'guarded':flagged,'disclaimer':ai.DISCLAIMER}
+
+def can_see_conflict(user,c):
+    """Same visibility the rest of the API gives each role (patients: own patient-verifiable; workers: their own; staff reviewers: all)."""
+    role=user['role']
+    if role in ('supervisor','clinician'): return True
+    if role=='patient': return c['patient_id']==user.get('linked_patient_id') and c['category']=='PATIENT_VERIFIABLE'
+    uid=str(user['_id'])
+    return c.get('actor_id')==uid or any(h.get('actor_id')==uid and h.get('action') in ('created','proposed_again','evidence_submitted') for h in c.get('history',[]))
+
+@app.post('/api/ai/conflict-explanation')
+def ai_conflict_explanation(body:ExplainIn,user=Depends(require_roles('patient','worker','supervisor','clinician'))):
+    """Explains a conflict in plain language. It is sent NO record values and NO identifiers, has no tools, and can only return text:
+    it cannot approve, reject or resolve anything (those remain the M3 endpoints with their own role checks)."""
+    lang=ai_language(body.language)
+    c=db.conflicts.find_one({'conflict_id':body.conflict_id})
+    if not c or not can_see_conflict(user,c): fail(404,'conflict_not_found','Conflict not found.')
+    patient=db.patients.find_one({'patient_id':c['patient_id']}) or {}
+    ev=[clean(e) for e in db.evidence.find({'conflict_id':c['conflict_id']})] if c['category']=='DOCUMENT_VERIFIABLE' else []
+    cf=[clean(x) for x in db.patient_confirmations.find({'conflict_id':c['conflict_id']})] if c['category']=='PATIENT_VERIFIABLE' else []
+    facts=ai.conflict_facts(user['role'],c,ev,cf,conflict_view(c,patient)['changed_since_raised'])
+    ai_ready(user)
+    try: audit(c['patient_id'],user,'AI_ASSIST','A conflict explanation was requested (no record values shared)',{'mode':'conflict_explanation','conflict_id':c['conflict_id'],'language':lang})
+    except PyMongoError: fail(503,'audit_unavailable','The request could not be recorded, so nothing was sent. Please try again.')
+    text=ai_call([{'role':'system','content':ai.EXPLAIN_SYSTEM+ai.language_line(lang)},{'role':'user','content':'Facts:\n'+'\n'.join(f'- {k}: {v}' for k,v in facts.items())}],max_tokens=450)
+    text,flagged=ai.guard_output(text)
+    return {'explanation':text,'language':lang,'source':'ai','facts_used':facts,'guarded':flagged,'note':'This explanation cannot approve, reject or resolve anything.','disclaimer':ai.DISCLAIMER}

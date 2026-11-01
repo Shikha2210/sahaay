@@ -168,3 +168,12 @@ Still open / newly noted: patient UI to confirm (API ready), worker evidence sub
 * **X8** patients could not read their own record → **FIXED** (`/api/me/record`, own record only).
 * **New (found and fixed):** sentences with bold text inside conflict cards rendered split by the app's flex CSS.
 * **Still open:** S5 (rejected operations look successful), clinician audit-history view, supervisor Audit page placeholder, staff creation UI, no unlink flow, offline behaviour of the new screens untested, mobile/accessibility untested.
+
+---
+# Status after Milestone 5 (2026-11-02) — AI integration
+* **AI1** (single prompt, no server-side safety, no rate limit) → **FIXED** (emergency short-circuit, output guard, per-user + shared limits, structured errors). Heuristic, English-only guard: see MILESTONE_5_REPORT §7.
+* **AI2** (chat text stored indefinitely, no PII removal) → **FIXED** (nothing stored; identifiers removed before sending; content-free audit rows only).
+* **AI3** (personalised prompt chips, dead scripted `aiReply`) → **FIXED** (general prompts; dead code removed; badge reflects real server status).
+* **AI4** (generic 502 on any failure) → **FIXED** (distinct, structured, user-friendly errors; offline handling).
+* **New (found and fixed):** the shared dialog had no height limit/scrolling, so tall dialogs hid their confirmation buttons (exposed by the AI sections; regression test added).
+* **Still open:** real Groq never exercised (no key); multilingual reply quality unverified; identifier removal is pattern-based (cannot catch names); no patient-side consent when a clinician requests a summary; rate limit is per-process.

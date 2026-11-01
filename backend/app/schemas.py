@@ -119,8 +119,17 @@ class IdentityAttemptIn(BaseModel):
     method: Literal['AADHAAR_SECURE_QR', 'OFFLINE_EKYC_XML']
 
 
+class ChatTurn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    role: Literal['user', 'assistant']
+    text: str = Field(max_length=2000)
+
+
 class ChatIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     message: str = Field(min_length=1, max_length=2000)
+    language: str = Field(default='auto', max_length=8)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=12)     # kept in the browser only; redacted again by the server
 
     @field_validator('message')
     @classmethod
@@ -128,3 +137,16 @@ class ChatIn(BaseModel):
         v = v.strip()
         if not v: raise ValueError('message must not be blank')
         return v
+
+
+class SummaryIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    patient_id: str | None = Field(default=None, max_length=40)              # patients may omit it (their own record is used); clinicians must name one
+    language: str = Field(default='auto', max_length=8)
+    acknowledge_external_ai: bool = False                                    # explicit consent to send minimal, de-identified details to an external AI service
+
+
+class ExplainIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    conflict_id: str = Field(min_length=3, max_length=64)
+    language: str = Field(default='auto', max_length=8)

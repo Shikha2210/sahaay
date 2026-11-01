@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     cors_origins: str = Field(default='http://localhost:5173,http://127.0.0.1:5173', alias='CORS_ORIGINS')
     groq_api_key: str = Field(default='', alias='GROQ_API_KEY')
     groq_model: str = Field(default='llama-3.3-70b-versatile', alias='GROQ_MODEL')
+    # Where the backend sends AI requests. The API key never leaves the backend; this URL is server configuration only
+    # (https, or http to this machine for local test doubles).
+    groq_api_url: str = Field(default='https://api.groq.com/openai/v1/chat/completions', alias='GROQ_API_URL')
+    ai_timeout_seconds: int = Field(default=20, ge=3, le=60, alias='AI_TIMEOUT_SECONDS')
+    ai_rate_per_minute: int = Field(default=10, ge=1, le=120, alias='AI_RATE_PER_MINUTE')            # per signed-in user
+    ai_global_per_minute: int = Field(default=30, ge=1, le=600, alias='AI_GLOBAL_PER_MINUTE')         # all users together (protects the shared key)
     bootstrap_supervisor_email: str = Field(default='supervisor@example.com', alias='BOOTSTRAP_SUPERVISOR_EMAIL')
     # No default: only needed when no supervisor exists yet. Validated when used (see bootstrap()).
     bootstrap_supervisor_password: str = Field(default='', alias='BOOTSTRAP_SUPERVISOR_PASSWORD')
@@ -72,6 +78,13 @@ class Settings(BaseSettings):
     @classmethod
     def _check_secret(cls, v):
         return validate_jwt_secret(v)
+
+    @field_validator('groq_api_url')
+    @classmethod
+    def _check_ai_url(cls, v):
+        if not (v.startswith('https://') or v.startswith('http://127.0.0.1') or v.startswith('http://localhost')):
+            raise ValueError('GROQ_API_URL must be https:// (or http:// to localhost for a local test double)')
+        return v
 
     @field_validator('cors_origins')
     @classmethod

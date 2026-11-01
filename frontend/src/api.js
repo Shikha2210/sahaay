@@ -35,16 +35,17 @@ export function tokenExpiry(token) {
 export const isTokenExpired = (token, now = Date.now()) => { const exp = tokenExpiry(token); return exp === null || exp <= now; };
 
 export class ApiError extends Error {
-  constructor(message, { status = 0, code = null } = {}) { super(message); this.name = 'ApiError'; this.status = status; this.code = code; }
+  constructor(message, { status = 0, code = null, detail = null } = {}) { super(message); this.name = 'ApiError'; this.status = status; this.code = code; this.detail = detail; }
 }
 
-export async function api(path, options = {}) {
+export async function api(path, rawOptions = {}) {
+  const { timeoutMs, ...options } = rawOptions;   // timeoutMs: per-call override (the AI assistant needs longer than ordinary calls)
   const headers = new Headers(options.headers || {});
   if (!(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const token = getToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs || REQUEST_TIMEOUT_MS);
   let response;
   try {
     response = await fetch(`${API_BASE}${path}`, { ...options, headers, signal: controller.signal });
@@ -62,7 +63,7 @@ export async function api(path, options = {}) {
       setToken(null);
       window.dispatchEvent(new CustomEvent(SESSION_EXPIRED_EVENT, { detail: { code } }));
     }
-    throw new ApiError(message, { status: response.status, code });
+    throw new ApiError(message, { status: response.status, code, detail: d && typeof d === 'object' && !Array.isArray(d) ? d : null });
   }
   return data;
 }

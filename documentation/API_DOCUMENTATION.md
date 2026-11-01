@@ -63,3 +63,11 @@ The conflict, evidence, confirmation and account-linking rows in the table above
 | `GET /api/sync/conflicts?status=` | worker, supervisor, clinician | conflicts from the caller's own synced changes (notifications) + evidence outcomes |
 | `GET /api/evidence?status=` | clinician, supervisor | evidence queue/history with conflict context |
 | `GET /api/admin/patient-accounts` | supervisor | patient logins and link status (no secrets) |
+
+## AI endpoints (Milestone 5) — see MILESTONE_5_REPORT.md for what is and is not sent to the external service
+| Endpoint | Roles | Notes |
+|---|---|---|
+| `GET /api/ai/status` | any signed-in | `{configured, languages, rate_limit_per_minute, disclaimer}`; never the key |
+| `POST /api/chatbot/message` | any signed-in | `{message, language?, history?}` (no other fields). Identifiers removed before sending; emergencies answered without the AI; nothing stored. Errors: `ai_not_configured` 503, `ai_rate_limited` 429 (+`Retry-After`), `ai_timeout` 504, `ai_unavailable`/`ai_bad_response`/`ai_misconfigured` 502, `unsupported_language` 422 |
+| `POST /api/ai/patient-summary` | patient (own record), clinician (named record) | requires `acknowledge_external_ai: true`; sends age range + clinical details only; audited first (`AI_ASSIST`); `consent_required` 422, `not_your_record` 403, `account_not_linked` 409 |
+| `POST /api/ai/conflict-explanation` | patient, worker, supervisor, clinician (same visibility as the conflict APIs) | sends no record values or identifiers; text only; cannot approve/reject/resolve; unseen/unknown conflict → 404 |

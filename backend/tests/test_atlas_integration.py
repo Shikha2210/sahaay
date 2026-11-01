@@ -29,7 +29,7 @@ ENABLED = os.environ.get("SAHAAY_ATLAS_TESTS") == "1" and URI.startswith("mongod
 pytestmark = [pytest.mark.needs_atlas,
               pytest.mark.skipif(not ENABLED, reason="Atlas tests are opt-in: need backend/.env MONGODB_URI and SAHAAY_ATLAS_TESTS=1")]
 
-from app import main, security  # noqa: E402
+from app import main, security, ai  # noqa: E402
 import app.db as dbmod  # noqa: E402
 
 
@@ -483,3 +483,89 @@ def test_clinician_evidence_queue_and_supervisor_account_list_on_atlas(real, api
     assert next(r for r in sup.get("/api/admin/patient-accounts").json() if r["email"] == acct["email"])["linked_patient_id"] == pid
     w3, _ = actor(database, "worker")                                  # identity overrides are global: switch back to a worker explicitly
     assert w3.get("/api/admin/patient-accounts").status_code == 403
+
+
+# 8 ------------------------------------------------------------------------------------------------------------
+# Milestone 5: AI endpoints on REAL Atlas. Only the external AI service is a test double (no Groq key exists); roles, queries,
+# audit and storage are real. We inspect exactly what would have been sent to the external service.
+import copy as _copy
+import json as _json
+
+
+@pytest.fixture
+def ai_double(monkeypatch):
+    box = type("Box", (), {})(); box.calls, box.reply = [], "TEST-DOUBLE-REPLY-NEVER-STORE"
+    def fake(messages, max_tokens=500):
+        box.calls.append(_copy.deepcopy(messages)); return box.reply
+    monkeypatch.setattr(ai, "groq_chat", fake)
+    monkeypatch.setattr(main.settings, "groq_api_key", "test-double-key-not-real")
+    monkeypatch.setattr(main.settings, "ai_rate_per_minute", 100); monkeypatch.setattr(main.settings, "ai_global_per_minute", 1000)
+    ai.limiter.reset()
+    return box
+
+
+def all_documents_as_text(database):
+    return _json.dumps({n: list(database[n].find({})) for n in database.list_collection_names()}, default=str)
+
+
+def test_ai_summary_sends_minimal_data_audits_and_stores_nothing_on_atlas(real, api, ai_double):
+    _, database = real
+    pid = new_pid(); w, _ = actor(database, "worker")
+    assert sync(w, create(pid, "device-A"))[0]["status"] == "applied"
+    assert sync(w, op("op-" + secrets.token_hex(6), pid, "device-A", 1, dosage="5 mg", condition="Hypertension, call 9876543210"))[0]["status"] == "applied"
+    sup, _ = actor(database, "supervisor"); acct = make_patient_account(database)
+    assert link_account(database, sup, pid, acct).status_code == 200
+    me = {**acct, "linked_patient_id": pid}
+    main.app.dependency_overrides[security.current_user] = lambda: me
+    c = TestClient(main.app)
+    assert c.post("/api/ai/patient-summary", json={"acknowledge_external_ai": False}).status_code == 422 and ai_double.calls == []
+    r = c.post("/api/ai/patient-summary", json={"acknowledge_external_ai": True, "language": "hi"})
+    assert r.status_code == 200 and r.json()["summary"] == ai_double.reply
+    sent = _json.dumps(ai_double.calls, ensure_ascii=False)
+    for private in ("Atlas Test", "9000000001", "Rampur", pid, "9876543210", "UNVERIFIED"): assert private not in sent, private
+    assert "Hypertension" in sent and "5 mg" in sent and "[phone number removed]" in sent and "Hindi" in ai_double.calls[0][0]["content"]
+    rows = list(database.audit.find({"patient_id": pid, "event_type": "AI_ASSIST"}))
+    assert len(rows) == 1 and rows[0]["actor_id"] == str(acct["_id"]) and rows[0]["metadata"]["mode"] == "patient_summary" and "condition" in rows[0]["metadata"]["fields_shared"]
+    assert ai_double.reply not in all_documents_as_text(database)                                           # nothing the AI wrote is stored
+    other = {**make_patient_account(database), "linked_patient_id": new_pid()}
+    main.app.dependency_overrides[security.current_user] = lambda: other
+    refused = TestClient(main.app).post("/api/ai/patient-summary", json={"patient_id": pid, "acknowledge_external_ai": True})
+    assert refused.status_code == 403 and refused.json()["detail"]["code"] == "not_your_record"
+    assert len(ai_double.calls) == 1
+
+
+def test_ai_conflict_explanation_visibility_and_no_changes_on_atlas(real, api, ai_double):
+    _, database = real
+    w1, u1 = actor(database, "worker")
+    pid = new_pid(); sync(w1, create(pid, "device-A"))
+    sync(w1, op("op-" + secrets.token_hex(6), pid, "device-A", 1, phone="9111111111"))
+    cid = sync(w1, op("op-" + secrets.token_hex(6), pid, "device-B", 1, phone="9222222222"))[0]["conflicts"][0]["conflict_id"]
+    before = {n: list(database[n].find({}).sort("_id", 1)) for n in ("patients", "conflicts", "evidence", "patient_confirmations", "changes")}
+    explain = lambda: TestClient(main.app).post("/api/ai/conflict-explanation", json={"conflict_id": cid, "language": "ta"})
+    mine = explain()                                                                           # the worker whose change raised it (real $or / history query data)
+    assert mine.status_code == 200 and mine.json()["explanation"] == ai_double.reply
+    sent = _json.dumps(ai_double.calls, ensure_ascii=False)
+    for private in ("9111111111", "9222222222", "Atlas Test", pid, cid, "Rampur"): assert private not in sent, private
+    assert "Do NOT approve, reject or resolve" in ai_double.calls[0][0]["content"] and "Tamil" in ai_double.calls[0][0]["content"]
+    other, _ = actor(database, "worker")
+    assert explain().json()["detail"]["code"] == "conflict_not_found"                         # another worker cannot see it
+    patient_other = {**make_patient_account(database), "linked_patient_id": new_pid()}
+    main.app.dependency_overrides[security.current_user] = lambda: patient_other
+    assert explain().status_code == 404                                                        # another patient cannot see it
+    actor(database, "clinician"); assert explain().status_code == 200                          # reviewers can
+    after = {n: list(database[n].find({}).sort("_id", 1)) for n in before}
+    assert after == before and database.conflicts.find_one({"conflict_id": cid})["status"] == "pending"   # the AI changed nothing
+    assert database.audit.count_documents({"patient_id": pid, "event_type": "AI_ASSIST"}) == 2
+
+
+def test_ai_chat_stores_nothing_and_removes_identifiers_on_atlas(real, api, ai_double):
+    _, database = real
+    c, u = actor(database, "worker")
+    r = c.post("/api/chatbot/message", json={"message": "My Aadhaar 2345 6789 0123, phone 9876543210. ZZ-QUESTION-NEVER-STORED what is anemia?"})
+    assert r.status_code == 200 and set(r.json()["redactions"]) == {"Aadhaar-like number", "phone number"}
+    sent = _json.dumps(ai_double.calls)
+    assert "2345" not in sent and "9876543210" not in sent and "ZZ-QUESTION-NEVER-STORED" in sent
+    text = all_documents_as_text(database)
+    assert "ZZ-QUESTION-NEVER-STORED" not in text and ai_double.reply not in text
+    assert "chat_messages" not in database.list_collection_names() or database.chat_messages.count_documents({"user_id": str(u["_id"])}) == 0
+    assert c.post("/api/chatbot/message", json={"message": "I have chest pain"}).json()["emergency"] is True and len(ai_double.calls) == 1
