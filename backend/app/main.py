@@ -1,4 +1,4 @@
-import uuid, re
+import uuid, re, json, hashlib
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Query, APIRouter, Request
@@ -8,7 +8,7 @@ from pymongo import ReturnDocument
 from bson import ObjectId
 from app.config import settings
 from app.db import client, db, init_db
-from app.schemas import RegisterIn, LoginIn, PatientIn, BatchIn, ResolveIn, IdentityAttemptIn, ChatIn, operation_problem
+from app.schemas import RegisterIn, LoginIn, PatientIn, BatchIn, ResolveIn, IdentityAttemptIn, ChatIn, operation_problem, validate_change_values, EvidenceSubmitIn, EvidenceReviewIn, ConfirmIn, LinkAccountIn
 from app.security import hash_password, verify_password, create_token, current_user, require_roles, public_user, login_limiter
 from app.config import validate_bootstrap_password, validate_bootstrap_email
 
@@ -42,9 +42,10 @@ def bootstrap():
     if settings.seed_demo_data and db.patients.count_documents({})==0:
         samples=[{'patient_id':'SH-2041','name':'Asha Devi','age':38,'phone':'•••• 4821','village':'Rampur','condition':'Hypertension','identity_status':'VERIFIED','last_visit':'Today, 10:40 AM'}, {'patient_id':'SH-2042','name':'Ravi Kumar','age':51,'phone':'•••• 9012','village':'Khera','condition':'Follow-up due','identity_status':'PENDING','last_visit':'Yesterday'}, {'patient_id':'SH-2043','name':'Meena Sharma','age':25,'phone':'•••• 3350','village':'Ward 4','condition':'Routine care','identity_status':'UNVERIFIED','last_visit':'24 Oct 2026'}]
         for p in samples: p.update(version=1,field_versions={k:1 for k in p if k not in {'version','field_versions'}},updated_at=UTC()); db.patients.insert_one(p)
-        # Demo conflict examples are clearly marked as synthetic and do not mutate the seeded patient records.
-        for field,pid,a,b in [('Date of birth','SH-2041','12 Apr 1988','21 Apr 1988'),('Phone number','SH-2042','•••• 9012','•••• 9099'),('Medication dosage','SH-2043','10 mg','20 mg')]:
-            db.conflicts.update_one({'conflict_id':'CF-DEMO-'+pid},{'$setOnInsert':{'conflict_id':'CF-DEMO-'+pid,'patient_id':pid,'field':field,'category':'DOCUMENT_VERIFIABLE' if field=='Date of birth' else 'PATIENT_VERIFIABLE' if field=='Phone number' else 'CRITICAL_CLINICAL','value_a':a,'value_b':b,'status':'pending','synthetic':True,'created_at':UTC()}},upsert=True)
+        # Demo conflict examples use real schema fields, are clearly marked synthetic and can never be resolved (they would not
+        # correspond to a real competing edit). They do not change the seeded patients.
+        for field,pid,a,b in [('age','SH-2041',38,39),('phone','SH-2042','•••• 9012','•••• 9099'),('dosage','SH-2043','10 mg','20 mg')]:
+            db.conflicts.update_one({'conflict_id':'CF-DEMO-'+pid},{'$setOnInsert':{'conflict_id':'CF-DEMO-'+pid,'patient_id':pid,'field':field,'category':category(field),'value_a':a,'value_b':b,'status':'pending','synthetic':True,'field_version_at_conflict':1,'history':[],'created_at':UTC()}},upsert=True)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -198,8 +199,13 @@ def apply_operation(op, user, session):
     updates,conflicting=detect_field_conflicts(patient,incoming,op.base_version,op.device_id)
     conflicts=[]
     for field,current in conflicting.items():
-        cid='CF-'+uuid.uuid4().hex[:12].upper(); cat=category(field)
-        db.conflicts.insert_one({'conflict_id':cid,'operation_id':op.operation_id,'patient_id':op.patient_id,'field':field,'category':cat,'value_a':current,'value_b':incoming[field],'base_version':op.base_version,'server_version':patient.get('version',1),'status':'pending','created_at':now,'actor_id':str(user['_id']),'device_id':op.device_id},session=session)
+        cat=category(field); key=dedupe_key(incoming[field])
+        again=db.conflicts.find_one({'patient_id':op.patient_id,'field':field,'status':'pending','dedupe_key':key},session=session)
+        if again:   # the same competing value is already waiting for review: do not create a second pending conflict (C9)
+            db.conflicts.update_one({'conflict_id':again['conflict_id']},{'$push':{'history':{'at':now,'actor_id':str(user['_id']),'actor_role':user['role'],'action':'proposed_again','operation_id':op.operation_id,'device_id':op.device_id}}},session=session)
+            conflicts.append({'conflict_id':again['conflict_id'],'field':field,'category':cat,'existing':True}); continue
+        cid='CF-'+uuid.uuid4().hex[:12].upper()
+        db.conflicts.insert_one({'conflict_id':cid,'operation_id':op.operation_id,'patient_id':op.patient_id,'field':field,'category':cat,'value_a':current,'value_b':incoming[field],'base_version':op.base_version,'server_version':patient.get('version',1),'field_version_at_conflict':int(patient.get('field_versions',{}).get(field,1)),'dedupe_key':key,'status':'pending','created_at':now,'actor_id':str(user['_id']),'device_id':op.device_id,'history':[{'at':now,'actor_id':str(user['_id']),'actor_role':user['role'],'action':'created','operation_id':op.operation_id,'device_id':op.device_id}]},session=session)
         conflicts.append({'conflict_id':cid,'field':field,'category':cat})
     new_version=patient.get('version',1)
     if updates:
@@ -253,81 +259,228 @@ def sync_pull(since_seq:int=Query(default=0,ge=0),limit:int=Query(default=200,ge
     next_seq=docs[-1]['seq'] if docs else since_seq
     return {'changes':changes,'next_seq':next_seq,'has_more':len(docs)==limit}
 
+# =====================================================================================================================
+# CONFLICT ENGINE (Milestone 3).  Policy table + rationale: documentation/CONFLICT_POLICY.md
+# Principles: never last-write-wins; a resolution value always comes from approved evidence / a patient's confirmation /
+# a clinician's explicit decision; a reviewer's decision is valid only for the field version they actually reviewed;
+# everything a resolution touches commits in ONE transaction; every refusal is a structured {code, message} error.
+# =====================================================================================================================
+POLICY={
+ 'DOCUMENT_VERIFIABLE':{'resolve_roles':{'supervisor','clinician'},'resolutions':{'apply_evidence'}},
+ 'PATIENT_VERIFIABLE':{'resolve_roles':{'supervisor','clinician'},'resolutions':{'apply_confirmation'}},
+ 'CRITICAL_CLINICAL':{'resolve_roles':{'clinician'},'resolutions':{'accept_current','accept_incoming','custom'}},
+ 'REQUIRES_REVIEW':{'resolve_roles':{'clinician'},'resolutions':{'accept_current','accept_incoming','custom'}},
+}
+ALL_RESOLUTIONS={'apply_evidence','apply_confirmation','accept_current','accept_incoming','custom','reject_incoming'}
+REJECT_ROLES={'clinician'}
+EVIDENCE_SUBMIT_ROLES=('worker','supervisor','clinician')
+AUDITED_REFUSALS={'role_not_permitted','stale_conflict','value_must_come_from_evidence','confirmation_no_longer_valid','resolution_not_allowed','approved_evidence_required','patient_confirmation_required'}
+
+def fail(http_status,code,message,**extra): raise HTTPException(http_status,{'code':code,'message':message,**extra})
+def dedupe_key(value): return hashlib.sha256(json.dumps(value,sort_keys=True,default=str).encode()).hexdigest()
+def field_state(patient,field): return patient.get(field),int(patient.get('field_versions',{}).get(field,1))
+def check_value(field,value):
+    if field not in SAFE_FIELDS: fail(422,'unsupported_field',f"'{field}' cannot be changed through conflict resolution",field=field)
+    if value is None or (isinstance(value,str) and not value.strip()): fail(422,'invalid_value','A non-empty value is required',field=field)
+    try: validate_change_values({field:value})
+    except ValueError as exc: fail(422,'invalid_value',str(exc),field=field)
+def history_entry(user,action,**detail): return {'at':UTC(),'actor_id':str(user['_id']),'actor_role':user['role'],'action':action,**detail}
+def run_tx(fn):
+    """Run fn(session) as ONE MongoDB transaction (the driver retries transient errors). Nothing is reported as done unless it committed."""
+    try:
+        with client.start_session() as session: return session.with_transaction(fn)
+    except (HTTPException,DuplicateKeyError): raise
+    except PyMongoError: fail(503,'transaction_failed','The change could not be saved and nothing was changed. Please retry.')
+def conflict_view(c,patient):
+    cur,fv=field_state(patient or {},c['field'])
+    v=clean(c); v.pop('dedupe_key',None)
+    v.update(current_value=cur,current_field_version=fv,changed_since_raised=(cur!=c.get('value_a')) or fv!=c.get('field_version_at_conflict',fv))
+    return v
+def allowed_actions(role,c,evidence,confirmations):
+    none={'resolutions':[],'can_reject':False,'can_submit_evidence':False,'can_review_evidence':False,'can_confirm':False}
+    if c['status']!='pending' or c.get('synthetic'): return none
+    pol=POLICY[c['category']]; res=[]
+    if role in pol['resolve_roles']:
+        for r in sorted(pol['resolutions']):
+            if r=='apply_evidence' and not any(e['status']=='approved' for e in evidence): continue
+            if r=='apply_confirmation' and not any(x['status']=='confirmed' for x in confirmations): continue
+            res.append(r)
+    doc=c['category']=='DOCUMENT_VERIFIABLE'
+    return {'resolutions':res,'can_reject':role in REJECT_ROLES,'can_submit_evidence':doc and role in EVIDENCE_SUBMIT_ROLES,'can_review_evidence':doc and role=='clinician','can_confirm':role=='patient' and c['category']=='PATIENT_VERIFIABLE'}
+
 @app.get('/api/conflicts')
 def conflicts(status:str='pending',user=Depends(require_roles('supervisor','clinician'))):
-    return [clean(c) for c in db.conflicts.find({'status':status}).sort('created_at',-1).limit(500)]
+    if status not in {'pending','resolved','rejected','all'}: fail(400,'invalid_status',"status must be pending, resolved, rejected or all")
+    rows=list(db.conflicts.find({} if status=='all' else {'status':status}).sort('created_at',-1).limit(500))
+    pats={p['patient_id']:p for p in db.patients.find({'patient_id':{'$in':list({r['patient_id'] for r in rows})}})}
+    return [conflict_view(r,pats.get(r['patient_id'])) for r in rows]
+
+@app.get('/api/conflicts/{conflict_id}')
+def conflict_detail(conflict_id:str,user=Depends(require_roles('supervisor','clinician'))):
+    c=db.conflicts.find_one({'conflict_id':conflict_id})
+    if not c: fail(404,'conflict_not_found','Conflict not found')
+    ev=[clean(e) for e in db.evidence.find({'conflict_id':conflict_id})]; cf=[clean(x) for x in db.patient_confirmations.find({'conflict_id':conflict_id})]
+    for x in cf: x.pop('user_id',None)
+    v=conflict_view(c,db.patients.find_one({'patient_id':c['patient_id']}))
+    v.update(evidence=ev,confirmations=cf,allowed=allowed_actions(user['role'],c,ev,cf))
+    return v
+
+@app.get('/api/me/conflicts')
+def my_conflicts(user=Depends(require_roles('patient'))):
+    """The signed-in patient's OWN eligible conflicts (patient-verifiable, pending, on the record linked to this account)."""
+    pid=user.get('linked_patient_id')
+    if not pid: return {'linked':False,'conflicts':[]}
+    out=[]
+    for c in db.conflicts.find({'patient_id':pid,'category':'PATIENT_VERIFIABLE','status':'pending'}).sort('created_at',-1).limit(100):
+        mine=db.patient_confirmations.find_one({'conflict_id':c['conflict_id'],'user_id':str(user['_id'])})
+        out.append({'conflict_id':c['conflict_id'],'patient_id':pid,'field':c['field'],'value_a':c['value_a'],'value_b':c['value_b'],'created_at':c['created_at'],'my_confirmation':({'confirmation_id':mine['confirmation_id'],'confirmed_value':mine['confirmed_value']} if mine else None)})
+    return {'linked':True,'patient_id':pid,'conflicts':out}
+
+@app.post('/api/patients/{patient_id}/confirm-field')
+def confirm_field(patient_id:str,body:ConfirmIn,user=Depends(require_roles('patient'))):
+    """A patient confirms which of the two competing values is correct for THEIR OWN linked record. Records a confirmation only;
+    it never changes the patient record - a supervisor/clinician applies it with resolution=apply_confirmation."""
+    if user.get('linked_patient_id')!=patient_id: fail(403,'not_your_record','This account is not linked to that patient record.')
+    c=db.conflicts.find_one({'conflict_id':body.conflict_id,'patient_id':patient_id})
+    if not c: fail(404,'conflict_not_found','No such conflict on your record.')
+    if c['category']!='PATIENT_VERIFIABLE': fail(403,'not_patient_verifiable','This information cannot be confirmed by the patient.',category=c['category'])
+    if c['status']!='pending' or c.get('synthetic'): fail(409,'conflict_not_pending','This conflict is no longer open.',status=c['status'])
+    check_value(c['field'],body.confirmed_value)
+    if body.confirmed_value not in (c['value_a'],c['value_b']): fail(422,'value_not_proposed','Choose one of the two values shown.',proposed=[c['value_a'],c['value_b']])
+    patient=db.patients.find_one({'patient_id':patient_id}) or {}
+    _,fv=field_state(patient,c['field'])
+    conf={'confirmation_id':'PC-'+uuid.uuid4().hex[:12].upper(),'conflict_id':c['conflict_id'],'patient_id':patient_id,'user_id':str(user['_id']),'field':c['field'],'confirmed_value':body.confirmed_value,'status':'confirmed','field_version_seen':fv,'confirmed_at':UTC()}
+    def work(s):
+        db.patient_confirmations.insert_one(conf,session=s)
+        db.conflicts.update_one({'conflict_id':c['conflict_id']},{'$push':{'history':history_entry(user,'patient_confirmed',confirmation_id=conf['confirmation_id'])}},session=s)
+        db.audit.insert_one({'patient_id':patient_id,'actor_id':str(user['_id']),'actor_role':'patient','event_type':'PATIENT_CONFIRMATION','description':f"Patient confirmed a value for {c['field']}",'metadata':{'conflict_id':c['conflict_id'],'field':c['field'],'confirmation_id':conf['confirmation_id']},'created_at':UTC()},session=s)
+    try: run_tx(work)
+    except DuplicateKeyError: fail(409,'already_confirmed','You have already confirmed a value for this conflict.')
+    return {'confirmation_id':conf['confirmation_id'],'status':'confirmed','confirmed_value':body.confirmed_value,'note':'Recorded. The record itself is changed only when a supervisor or clinician applies your confirmation.'}
+
+@app.post('/api/conflicts/{conflict_id}/evidence')
+def submit_evidence(conflict_id:str,body:EvidenceSubmitIn,user=Depends(require_roles(*EVIDENCE_SUBMIT_ROLES))):
+    c=db.conflicts.find_one({'conflict_id':conflict_id})
+    if not c: fail(404,'conflict_not_found','Conflict not found')
+    if c['category']!='DOCUMENT_VERIFIABLE': fail(409,'not_document_verifiable','Evidence applies to document-verifiable conflicts only.',category=c['category'])
+    if c['status']!='pending' or c.get('synthetic'): fail(409,'conflict_not_pending','This conflict is no longer open.',status=c['status'])
+    check_value(c['field'],body.claimed_value)
+    doc={'evidence_reference':body.reference,'conflict_id':conflict_id,'patient_id':c['patient_id'],'description':body.description.strip(),'claimed_value':body.claimed_value,'submitted_by':str(user['_id']),'submitted_role':user['role'],'status':'pending_review','created_at':UTC()}
+    def work(s):
+        db.evidence.insert_one(doc,session=s)
+        db.conflicts.update_one({'conflict_id':conflict_id},{'$push':{'history':history_entry(user,'evidence_submitted',evidence_reference=body.reference)}},session=s)
+        db.audit.insert_one({'patient_id':c['patient_id'],'actor_id':str(user['_id']),'actor_role':user['role'],'event_type':'EVIDENCE_SUBMITTED','description':'Evidence reference submitted for review','metadata':{'conflict_id':conflict_id,'evidence_reference':body.reference,'field':c['field']},'created_at':UTC()},session=s)
+    try: run_tx(work)
+    except DuplicateKeyError:
+        old=db.evidence.find_one({'conflict_id':conflict_id,'evidence_reference':body.reference}) or {}
+        fail(409,'evidence_reference_already_used','This evidence reference was already submitted for this conflict. Submit the document under a NEW reference.',existing_status=old.get('status'))
+    return {'evidence_reference':body.reference,'status':'pending_review','warning':'This records a reference only; it does not authenticate the document.'}
+
+@app.post('/api/conflicts/{conflict_id}/evidence/{evidence_reference}/review')
+def review_evidence(conflict_id:str,evidence_reference:str,body:EvidenceReviewIn,user=Depends(require_roles('clinician'))):
+    c=db.conflicts.find_one({'conflict_id':conflict_id})
+    if not c: fail(404,'conflict_not_found','Conflict not found')
+    if c['category']!='DOCUMENT_VERIFIABLE': fail(409,'not_document_verifiable','Evidence applies to document-verifiable conflicts only.')
+    if c['status']!='pending': fail(409,'conflict_not_pending','This conflict is no longer open.',status=c['status'])
+    ev=db.evidence.find_one({'conflict_id':conflict_id,'evidence_reference':evidence_reference})
+    if not ev: fail(404,'evidence_not_found','Evidence reference not found for this conflict.')
+    if ev['status']!='pending_review': fail(409,'evidence_already_reviewed','This evidence has already been reviewed.',status=ev['status'])
+    if ev['submitted_by']==str(user['_id']): fail(403,'separation_of_duties','You submitted this evidence, so you cannot review it.')
+    approved=None
+    if body.decision=='approve':
+        if body.approved_value is None: fail(422,'approved_value_required','When approving, record the exact value the evidence supports.')
+        check_value(c['field'],body.approved_value); approved=body.approved_value
+    new_status='approved' if body.decision=='approve' else 'rejected'
+    def work(s):
+        r=db.evidence.update_one({'_id':ev['_id'],'status':'pending_review'},{'$set':{'status':new_status,'approved_value':approved,'reviewed_by':str(user['_id']),'review_note':body.review_note,'reviewed_at':UTC()}},session=s)
+        if r.matched_count!=1: fail(409,'evidence_already_reviewed','This evidence has already been reviewed.')
+        db.conflicts.update_one({'conflict_id':conflict_id},{'$push':{'history':history_entry(user,'evidence_'+new_status,evidence_reference=evidence_reference,approved_value=approved)}},session=s)
+        db.audit.insert_one({'patient_id':c['patient_id'],'actor_id':str(user['_id']),'actor_role':user['role'],'event_type':'EVIDENCE_REVIEWED','description':'Evidence reference reviewed','metadata':{'conflict_id':conflict_id,'evidence_reference':evidence_reference,'decision':body.decision,'claimed_value':ev.get('claimed_value'),'approved_value':approved,'field':c['field']},'created_at':UTC()},session=s)
+    run_tx(work)
+    return {'evidence_reference':evidence_reference,'status':new_status,'approved_value':approved,'note':'Approval records a reviewer decision and the exact approved value; it is not cryptographic document authentication.'}
+
+def _resolve(conflict_id,body,user,s):
+    """Runs INSIDE one transaction (re-run by the driver on transient errors, so it only reads current state and writes at the end)."""
+    c=db.conflicts.find_one({'conflict_id':conflict_id},session=s)
+    if not c: fail(404,'conflict_not_found','Conflict not found')
+    if c['status']!='pending': fail(409,'conflict_not_pending',f"This conflict is already {c['status']}.",status=c['status'])
+    if c.get('synthetic'): fail(400,'synthetic_conflict','Synthetic demonstration conflicts cannot modify patient records.')
+    cat=c['category']; pol=POLICY[cat]; res=body.resolution; field=c['field']
+    roles=REJECT_ROLES if res=='reject_incoming' else pol['resolve_roles']
+    if user['role'] not in roles: fail(403,'role_not_permitted',f"Only {' or '.join(sorted(roles))} may do this for a {cat} conflict.",required_roles=sorted(roles),category=cat)
+    if res!='reject_incoming' and res not in pol['resolutions']: fail(400,'resolution_not_allowed',f"'{res}' is not allowed for a {cat} conflict.",allowed=sorted(pol['resolutions']|{'reject_incoming'}),category=cat)
+    patient=db.patients.find_one({'patient_id':c['patient_id']},session=s)
+    if not patient: fail(404,'patient_not_found','Patient record not found')
+    current,fv=field_state(patient,field)
+    note=(body.note or '').strip() or None
+    chosen=current; write=False; ev_ref=None; conf_id=None
+    if res=='reject_incoming':
+        if not note or len(note)<3: fail(422,'note_required','Explain why the incoming change is rejected (note).')
+    else:
+        if body.expected_field_version is None: fail(422,'expected_field_version_required','Send expected_field_version: the field version you reviewed.',current_field_version=fv)
+        if body.expected_field_version!=fv:
+            fail(409,'stale_conflict','This field changed after you opened the conflict. Nothing was changed - review the current value and decide again.',expected_field_version=body.expected_field_version,current_field_version=fv,current_value=current,conflict_value_a=c['value_a'],conflict_value_b=c['value_b'])
+        if res=='apply_evidence':
+            ev=db.evidence.find_one({'conflict_id':conflict_id,'evidence_reference':body.evidence_reference,'status':'approved'},session=s) if body.evidence_reference else None
+            if not ev: fail(400,'approved_evidence_required','Name an evidence reference that a clinician has approved for this conflict.')
+            if body.selected_value is not None and body.selected_value!=ev['approved_value']: fail(400,'value_must_come_from_evidence','The value is taken from the approved evidence; it cannot be chosen by the resolver.',approved_value=ev['approved_value'])
+            chosen=ev['approved_value']; ev_ref=ev['evidence_reference']; write=True
+        elif res=='apply_confirmation':
+            conf=db.patient_confirmations.find_one({'confirmation_id':body.patient_confirmation_id,'conflict_id':conflict_id,'status':'confirmed'},session=s) if body.patient_confirmation_id else None
+            if not conf: fail(400,'patient_confirmation_required','Name a confirmation the linked patient made for this conflict.')
+            who=db.users.find_one({'_id':ObjectId(conf['user_id']),'linked_patient_id':c['patient_id'],'active':True},session=s)
+            if not who: fail(400,'confirmation_no_longer_valid','The account that confirmed is no longer linked to this patient.')
+            if body.selected_value is not None and body.selected_value!=conf['confirmed_value']: fail(400,'value_must_come_from_evidence','The value is taken from the patient confirmation; it cannot be chosen by the resolver.',confirmed_value=conf['confirmed_value'])
+            chosen=conf['confirmed_value']; conf_id=conf['confirmation_id']; write=True
+        elif res=='accept_incoming': chosen=c['value_b']; write=True
+        elif res=='custom':
+            if not note or len(note)<3: fail(422,'note_required','Explain the value you are recording (note).')
+            chosen=body.selected_value; write=True
+        if write: check_value(field,chosen)
+        write = write and chosen!=current
+    now=UTC(); new_fv=fv; new_version=patient.get('version',1)
+    if write:
+        new_version+=1; new_fv=new_version
+        r=db.patients.update_one({'patient_id':c['patient_id'],'version':patient.get('version',1),f'field_versions.{field}':fv},{'$set':{field:chosen,f'field_versions.{field}':new_fv,f'field_writers.{field}':'resolution:'+conflict_id,'version':new_version,'updated_at':now}},session=s)
+        if r.matched_count!=1: fail(409,'stale_conflict','The record changed while you were resolving. Nothing was changed - review and decide again.',current_field_version=fv)
+        db.changes.insert_one({'seq':next_seq(s),'patient_id':c['patient_id'],'version':new_version,'changes':{field:chosen},'operation_id':'resolution:'+conflict_id,'created_at':now},session=s)
+    outcome='rejected' if res=='reject_incoming' else 'resolved'
+    r=db.conflicts.update_one({'conflict_id':conflict_id,'status':'pending'},{'$set':{'status':outcome,'resolution':res,'selected_value':chosen,'resolved_by':str(user['_id']),'resolved_role':user['role'],'resolved_at':now,'evidence_reference':ev_ref,'patient_confirmation_id':conf_id,'resolution_note':note,'field_version_reviewed':fv,'field_version_after':new_fv},'$push':{'history':history_entry(user,outcome,resolution=res,old_value=current,new_value=chosen,evidence_reference=ev_ref,patient_confirmation_id=conf_id,note=note)}},session=s)
+    if r.matched_count!=1: fail(409,'conflict_not_pending','This conflict was resolved by someone else.')
+    db.audit.insert_one({'patient_id':c['patient_id'],'actor_id':str(user['_id']),'actor_role':user['role'],'event_type':'CONFLICT_REJECTED' if res=='reject_incoming' else 'CONFLICT_RESOLVED','description':f'{outcome.capitalize()} {conflict_id}','metadata':{'conflict_id':conflict_id,'field':field,'category':cat,'resolution':res,'old_value':current,'new_value':chosen,'field_version_reviewed':fv,'field_version_after':new_fv,'evidence_reference':ev_ref,'patient_confirmation_id':conf_id,'note':note},'created_at':now},session=s)
+    return {'resolved':res!='reject_incoming','status':outcome,'conflict_id':conflict_id,'resolution':res,'selected_value':chosen,'patient_version':new_version,'field_version':new_fv}
 
 @app.post('/api/conflicts/{conflict_id}/resolve')
 def resolve_conflict(conflict_id:str,body:ResolveIn,user=Depends(require_roles('supervisor','clinician'))):
-    """Resolve only after category-specific proof is recorded. Uses a MongoDB transaction."""
-    if body.resolution not in {'accept_a','accept_b','custom'}:
-        raise HTTPException(400,"resolution must be accept_a, accept_b or custom")
-    try:
-        with client.start_session() as session:
-            with session.start_transaction():
-                c=db.conflicts.find_one({'conflict_id':conflict_id,'status':'pending'},session=session)
-                if not c: raise HTTPException(404,'Pending conflict not found')
-                if c.get('synthetic'): raise HTTPException(400,'Synthetic demonstration conflicts cannot modify patient records')
-                if c['category']=='CRITICAL_CLINICAL' and user['role']!='clinician':
-                    raise HTTPException(403,'Only an authorized clinician can resolve clinical conflicts')
-                if c['category']=='REQUIRES_REVIEW' and user['role']!='clinician':
-                    raise HTTPException(403,'Unknown fields require clinician review')
-                if c['category']=='DOCUMENT_VERIFIABLE':
-                    ev=db.evidence.find_one({'evidence_reference':body.evidence_reference,'conflict_id':conflict_id,'status':'approved'},session=session)
-                    if not ev: raise HTTPException(400,'A clinician-approved evidence record is required')
-                if c['category']=='PATIENT_VERIFIABLE':
-                    conf=db.patient_confirmations.find_one({'confirmation_id':body.patient_confirmation_id,'conflict_id':conflict_id,'status':'confirmed'},session=session)
-                    if not conf: raise HTTPException(400,'A verified patient confirmation record is required')
-                patient=db.patients.find_one({'patient_id':c['patient_id']},session=session)
-                if not patient: raise HTTPException(404,'Patient not found')
-                chosen=c['value_a'] if body.resolution=='accept_a' else c['value_b'] if body.resolution=='accept_b' else body.selected_value
-                if chosen is None: raise HTTPException(400,'A selected value is required for custom resolution')
-                field=c['field']; old_version=patient.get('version',1); new_version=old_version+1
-                updated=db.patients.update_one({'patient_id':c['patient_id'],'version':old_version},
-                    {'$set':{field:chosen,f'field_versions.{field}':new_version,'version':new_version,'updated_at':UTC()}},session=session)
-                if updated.modified_count!=1: raise HTTPException(409,'Patient changed during review. Reload the conflict and review again.')
-                changed=db.conflicts.update_one({'conflict_id':conflict_id,'status':'pending'},
-                    {'$set':{'status':'resolved','resolution':body.resolution,'selected_value':chosen,'resolved_by':str(user['_id']),'resolved_role':user['role'],'resolved_at':UTC(),'evidence_reference':body.evidence_reference,'patient_confirmation_id':body.patient_confirmation_id}},session=session)
-                if changed.modified_count!=1: raise HTTPException(409,'Conflict was already resolved by another reviewer')
-                seq=next_seq(session)
-                db.changes.insert_one({'seq':seq,'patient_id':c['patient_id'],'version':new_version,'changes':{field:chosen},'operation_id':'resolution:'+conflict_id,'created_at':UTC()},session=session)
-                db.audit.insert_one({'patient_id':c['patient_id'],'actor_id':str(user['_id']),'actor_role':user['role'],'event_type':'CONFLICT_RESOLVED','description':f'Resolved {conflict_id}','metadata':{'field':field,'category':c['category'],'resolution':body.resolution,'evidence_reference':body.evidence_reference,'patient_confirmation_id':body.patient_confirmation_id},'created_at':UTC()},session=session)
-        return {'resolved':True,'conflict_id':conflict_id,'patient_version':new_version,'selected_value':chosen}
-    except HTTPException: raise
-    except Exception as exc:
-        raise HTTPException(503,'Conflict resolution transaction failed; no success was recorded') from exc
+    if body.resolution not in ALL_RESOLUTIONS: fail(400,'unknown_resolution',f"'{body.resolution}' is not a resolution.",allowed=sorted(ALL_RESOLUTIONS))
+    try: return run_tx(lambda s:_resolve(conflict_id,body,user,s))
+    except HTTPException as exc:
+        d=exc.detail if isinstance(exc.detail,dict) else {}
+        if d.get('code') in AUDITED_REFUSALS:   # accountability for refused attempts (outside the rolled-back transaction)
+            try:
+                c=db.conflicts.find_one({'conflict_id':conflict_id}) or {}
+                audit(c.get('patient_id'),user,'CONFLICT_ACTION_DENIED',f"Refused: {d['code']}",{'conflict_id':conflict_id,'code':d['code'],'attempted_resolution':body.resolution})
+            except PyMongoError: pass
+        raise
 
 @app.post('/api/admin/patients/{patient_id}/link-account')
-def link_patient_account(patient_id:str,email:str,user=Depends(require_roles('supervisor'))):
-    """Link only after the supervisor has completed an out-of-band identity check."""
-    account=db.users.find_one({'email':email.lower(),'role':'patient','active':True})
-    if not account: raise HTTPException(404,'Active patient account not found')
-    if not db.patients.find_one({'patient_id':patient_id}): raise HTTPException(404,'Patient record not found')
-    existing=db.users.find_one({'linked_patient_id':patient_id,'_id':{'$ne':account['_id']}})
-    if existing: raise HTTPException(409,'Patient record is already linked to another account')
-    db.users.update_one({'_id':account['_id']},{'$set':{'linked_patient_id':patient_id,'linked_by':str(user['_id']),'linked_at':UTC()}})
-    audit(patient_id,user,'PATIENT_ACCOUNT_LINKED','Patient account linked after supervisor identity check',{'email':email.lower()})
-    return {'linked':True,'patient_id':patient_id,'email':email.lower()}
-
-@app.post('/api/conflicts/{conflict_id}/evidence')
-def submit_evidence(conflict_id:str,reference:str,description:str,user=Depends(require_roles('worker','supervisor','clinician'))):
-    c=db.conflicts.find_one({'conflict_id':conflict_id,'status':'pending','category':'DOCUMENT_VERIFIABLE'})
-    if not c: raise HTTPException(404,'Pending document-verifiable conflict not found')
-    if not reference.strip() or not description.strip(): raise HTTPException(400,'Evidence reference and description are required')
-    doc={'evidence_reference':reference.strip(),'conflict_id':conflict_id,'patient_id':c['patient_id'],'description':description.strip(),'submitted_by':str(user['_id']),'status':'pending_review','created_at':UTC()}
-    db.evidence.insert_one(doc)
-    audit(c['patient_id'],user,'EVIDENCE_SUBMITTED','Evidence reference submitted for review',{'conflict_id':conflict_id,'evidence_reference':reference.strip()})
-    return {'evidence_reference':reference.strip(),'status':'pending_review','warning':'This records a reference only; it does not authenticate the document.'}
-
-@app.post('/api/conflicts/{conflict_id}/evidence/{evidence_reference}/review')
-def review_evidence(conflict_id:str,evidence_reference:str,decision:str,review_note:str,user=Depends(require_roles('clinician'))):
-    if decision not in {'approve','reject'}: raise HTTPException(400,"decision must be approve or reject")
-    ev=db.evidence.find_one({'conflict_id':conflict_id,'evidence_reference':evidence_reference,'status':'pending_review'})
-    if not ev: raise HTTPException(404,'Pending evidence reference not found')
-    status='approved' if decision=='approve' else 'rejected'
-    db.evidence.update_one({'_id':ev['_id'],'status':'pending_review'},{'$set':{'status':status,'reviewed_by':str(user['_id']),'review_note':review_note,'reviewed_at':UTC()}})
-    audit(ev['patient_id'],user,'EVIDENCE_REVIEWED','Evidence reference reviewed',{'conflict_id':conflict_id,'evidence_reference':evidence_reference,'decision':decision})
-    return {'evidence_reference':evidence_reference,'status':status,'note':'Approval records a reviewer decision; it is not cryptographic document authentication.'}
+def link_patient_account(patient_id:str,body:LinkAccountIn,user=Depends(require_roles('supervisor'))):
+    """Link a patient's login to a patient record. Only after the supervisor attests an out-of-band identity check (recorded)."""
+    if not body.identity_verified: fail(422,'identity_check_required','Confirm that you verified the person\'s identity before linking.')
+    email=body.email.lower()
+    account=db.users.find_one({'email':email,'role':'patient','active':True})
+    if not account: fail(404,'patient_account_not_found','No active patient account with that email.')
+    if not db.patients.find_one({'patient_id':patient_id}): fail(404,'patient_not_found','Patient record not found.')
+    cur=account.get('linked_patient_id')
+    if cur==patient_id: return {'linked':True,'already_linked':True,'patient_id':patient_id}
+    if cur: fail(409,'account_already_linked','This account is already linked to another patient record. Links are not silently overwritten.')
+    if db.users.find_one({'linked_patient_id':patient_id}): fail(409,'patient_already_linked','This patient record is already linked to another account.')
+    check={'verified':True,'method':body.identity_check_method,'note':body.identity_check_note.strip(),'checked_by':str(user['_id']),'checked_at':UTC()}
+    try: r=db.users.update_one({'_id':account['_id'],'linked_patient_id':{'$exists':False}},{'$set':{'linked_patient_id':patient_id,'linked_by':str(user['_id']),'linked_at':UTC(),'identity_check':check}})
+    except DuplicateKeyError: fail(409,'patient_already_linked','This patient record is already linked to another account.')
+    if r.matched_count!=1: fail(409,'account_already_linked','This account is already linked to another patient record.')
+    audit(patient_id,user,'PATIENT_ACCOUNT_LINKED','Patient account linked after a recorded identity check',{'account_id':str(account['_id']),'identity_check_method':body.identity_check_method})
+    return {'linked':True,'already_linked':False,'patient_id':patient_id}
 
 @app.post('/api/identity/{patient_id}/attempt')
 def identity_attempt(patient_id:str,body:IdentityAttemptIn,user=Depends(require_roles('worker','supervisor'))):

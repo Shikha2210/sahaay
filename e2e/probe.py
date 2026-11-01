@@ -38,6 +38,9 @@ elif cmd == "remote_edit":
     ver = db.patients.find_one({"patient_id": pid})["version"]
     r = h.post("/api/sync/batch", headers=auth(tok), json={"operations": [{"operation_id": "synth-" + secrets.token_hex(8), "patient_id": pid, "device_id": "device-synth-API2", "base_version": ver, "changes": {field: value}}]})
     print(json.dumps(r.json()["results"][0]["status"]))
+elif cmd == "patient_fields":
+    p = db.patients.find_one({"patient_id": args[0]}) or {}
+    print(json.dumps({k: p.get(k) for k in ("age", "name", "phone", "condition", "dosage", "last_visit", "version")}))
 elif cmd == "counts":
     print(json.dumps({n: db[n].count_documents({}) for n in ("users", "patients", "operations", "changes", "conflicts", "audit", "evidence", "patient_confirmations")}))
 c.close()

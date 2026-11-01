@@ -16,6 +16,7 @@ import os
 import pathlib
 import secrets
 import concurrent.futures as cf
+from pymongo.errors import DuplicateKeyError
 import pytest
 from bson import ObjectId
 from dotenv import dotenv_values
@@ -177,44 +178,218 @@ def test_clinical_conflict_is_recorded_not_overwritten(real, api):
 
 
 # 5 ------------------------------------------------------------------------------------------------------------
-def _make_clinical_conflict(database, c):
-    pid = new_pid(); sync(c, create(pid, "device-A"))
-    sync(c, op("op-" + secrets.token_hex(6), pid, "device-A", 1, condition="Hypertension"))
-    sync(c, op("op-" + secrets.token_hex(6), pid, "device-B", 1, condition="Diabetes"))
-    return pid, database.conflicts.find_one({"patient_id": pid})["conflict_id"]
+# Milestone 3: conflict engine on REAL Atlas (disposable database `sahaay_test_<random>` only).
+def actor(database, role, **extra):
+    """Create a real user document in the throwaway database and make requests act as that user."""
+    u = {"_id": ObjectId(), "role": role, "email": f"{role}-{secrets.token_hex(3)}@example.com", "name": role, "active": True, **extra}
+    database.users.insert_one(dict(u))
+    main.app.dependency_overrides[security.current_user] = lambda: u
+    return TestClient(main.app), u
 
 
-def test_concurrent_conflict_resolution_applies_exactly_once(real, api):
+def raise_conflict(database, field, a, b, pid=None):
+    pid = pid or new_pid()
+    w, _ = actor(database, "worker")
+    sync(w, create(pid, "device-A"))
+    assert sync(w, op("op-" + secrets.token_hex(6), pid, "device-A", 1, **{field: a}))[0]["status"] == "applied"
+    r = sync(w, op("op-" + secrets.token_hex(6), pid, "device-B", 1, **{field: b}))[0]
+    assert r["status"] == "conflict"
+    return pid, r["conflicts"][0]["conflict_id"]
+
+
+def fv(database, pid, field): return database.patients.find_one({"patient_id": pid})["field_versions"][field]
+def code(r): return r.json()["detail"]["code"]
+
+
+def test_partial_unique_indexes_for_pending_conflicts_and_account_links_exist(real):
     _, database = real
-    c, _ = api("worker")
-    pid, cid = _make_clinical_conflict(database, c)
-    clinician = user("clinician")
+    names = set(database.conflicts.index_information()) | set(database.users.index_information())
+    assert {"uniq_pending_conflict", "uniq_linked_patient"} <= names
+
+
+def test_stale_clinical_resolution_is_rejected_on_atlas(real, api):
+    _, database = real
+    pid, cid = raise_conflict(database, "dosage", "10 mg", "20 mg")
+    seen = fv(database, pid, "dosage")
+    w, _ = actor(database, "worker")
+    assert sync(w, op("op-" + secrets.token_hex(6), pid, "device-A", 1, dosage="15 mg"))[0]["status"] == "applied"   # newer clinical value
+    cli, cu = actor(database, "clinician")
+    r = cli.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_incoming", "expected_field_version": seen})
+    assert r.status_code == 409 and code(r) == "stale_conflict" and r.json()["detail"]["current_value"] == "15 mg"
+    assert database.patients.find_one({"patient_id": pid})["dosage"] == "15 mg"                                       # not overwritten
+    assert database.conflicts.find_one({"conflict_id": cid})["status"] == "pending"
+    assert database.audit.count_documents({"patient_id": pid, "event_type": "CONFLICT_RESOLVED"}) == 0
+    assert database.audit.count_documents({"patient_id": pid, "event_type": "CONFLICT_ACTION_DENIED"}) == 1
+    ok = cli.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_incoming", "expected_field_version": fv(database, pid, "dosage")})
+    assert ok.status_code == 200 and database.patients.find_one({"patient_id": pid})["dosage"] == "20 mg"
+
+
+def test_two_simultaneous_clinical_updates_keep_both_values_on_atlas(real, api):
+    _, database = real
+    pid = new_pid(); w, _ = actor(database, "worker"); sync(w, create(pid, "device-A"))
+    ops = [op("op-" + secrets.token_hex(6), pid, "device-A", 1, condition="Hypertension"), op("op-" + secrets.token_hex(6), pid, "device-B", 1, condition="Diabetes")]
+    with cf.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda o: sync(TestClient(main.app), o)[0], ops))
+    assert sorted(r["status"] for r in results) == ["applied", "conflict"], results
+    winner = database.patients.find_one({"patient_id": pid})["condition"]
+    assert winner in ("Hypertension", "Diabetes")
+    pending = list(database.conflicts.find({"patient_id": pid, "status": "pending"}))
+    assert len(pending) == 1 and {pending[0]["value_a"], pending[0]["value_b"]} == {"Hypertension", "Diabetes"} and pending[0]["value_a"] == winner   # nothing lost
+
+
+def test_concurrent_conflict_resolution_applies_exactly_once_on_atlas(real, api):
+    _, database = real
+    pid, cid = raise_conflict(database, "condition", "Hypertension", "Diabetes")
+    v = fv(database, pid, "condition")
+    clinician = {"_id": ObjectId(), "role": "clinician", "email": "c@example.com", "name": "c", "active": True}
     main.app.dependency_overrides[security.current_user] = lambda: clinician
     before = database.patients.find_one({"patient_id": pid})["version"]
 
-    def attempt(choice):
-        return TestClient(main.app).post(f"/api/conflicts/{cid}/resolve", json={"resolution": choice})
+    def attempt(resolution):
+        return TestClient(main.app).post(f"/api/conflicts/{cid}/resolve", json={"resolution": resolution, "expected_field_version": v})
 
     with cf.ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(attempt, ["accept_a", "accept_b"]))
+        results = list(pool.map(attempt, ["accept_incoming", "accept_current"]))
     codes = sorted(r.status_code for r in results)
-    assert codes.count(200) == 1, [(r.status_code, r.text) for r in results]       # exactly one winner
-    assert all(code in (200, 404, 409, 503) for code in codes)                       # the loser failed safely
-    conflict = database.conflicts.find_one({"conflict_id": cid})
-    patient = database.patients.find_one({"patient_id": pid})
-    assert conflict["status"] == "resolved" and patient["version"] == before + 1     # applied once, not twice
-    assert patient["condition"] == conflict["selected_value"]
+    assert codes.count(200) == 1, [(r.status_code, r.text) for r in results]
+    loser = next(r for r in results if r.status_code != 200)
+    assert loser.status_code in (409, 503) and (loser.status_code == 503 or code(loser) in ("conflict_not_pending", "stale_conflict"))
+    cfd = database.conflicts.find_one({"conflict_id": cid}); p = database.patients.find_one({"patient_id": pid})
+    assert cfd["status"] == "resolved" and p["condition"] == cfd["selected_value"]
+    assert p["version"] in (before, before + 1)                                                 # at most ONE write happened
     assert database.audit.count_documents({"patient_id": pid, "event_type": "CONFLICT_RESOLVED"}) == 1
+    assert database.changes.count_documents({"operation_id": "resolution:" + cid}) <= 1
 
 
 def test_supervisor_cannot_resolve_clinical_conflict_in_atlas(real, api):
     _, database = real
-    c, _ = api("worker")
-    pid, cid = _make_clinical_conflict(database, c)
-    sup, _ = api("supervisor")
-    r = sup.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_a"})
-    assert r.status_code == 403
+    pid, cid = raise_conflict(database, "condition", "A", "B")
+    sup, _ = actor(database, "supervisor")
+    r = sup.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_incoming", "expected_field_version": fv(database, pid, "condition")})
+    assert r.status_code == 403 and code(r) == "role_not_permitted" and r.json()["detail"]["required_roles"] == ["clinician"]
     assert database.conflicts.find_one({"conflict_id": cid})["status"] == "pending"
+    assert database.patients.find_one({"patient_id": pid})["condition"] == "A"
+
+
+def test_evidence_workflow_binds_the_approved_value_on_atlas(real, api):
+    _, database = real
+    pid, cid = raise_conflict(database, "age", 40, 41)
+    wk, wu = actor(database, "worker")
+    r = wk.post(f"/api/conflicts/{cid}/evidence", json={"reference": "DOC-A1", "description": "synthetic", "claimed_value": 41})
+    assert r.status_code == 200
+    cli, cu = actor(database, "clinician")
+    bad = cli.post(f"/api/conflicts/{cid}/evidence/DOC-A1/review", json={"decision": "approve", "review_note": "ok ok", "approved_value": "forty"})
+    assert bad.status_code == 422 and code(bad) == "invalid_value"
+    assert cli.post(f"/api/conflicts/{cid}/evidence/DOC-A1/review", json={"decision": "approve", "review_note": "page 2 shows 42", "approved_value": 42}).status_code == 200
+    ev = database.evidence.find_one({"conflict_id": cid})
+    assert ev["claimed_value"] == 41 and ev["approved_value"] == 42 and ev["reviewed_by"] == str(cu["_id"])
+    sup, _ = actor(database, "supervisor"); v = fv(database, pid, "age")
+    arb = sup.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "custom", "selected_value": 99, "note": "because", "expected_field_version": v})
+    assert arb.status_code == 400 and code(arb) == "resolution_not_allowed"
+    mism = sup.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "apply_evidence", "evidence_reference": "DOC-A1", "selected_value": 99, "expected_field_version": v})
+    assert mism.status_code == 400 and code(mism) == "value_must_come_from_evidence"
+    assert database.patients.find_one({"patient_id": pid})["age"] == 40                           # nothing changed by refused attempts
+    ok = sup.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "apply_evidence", "evidence_reference": "DOC-A1", "expected_field_version": v})
+    assert ok.status_code == 200 and database.patients.find_one({"patient_id": pid})["age"] == 42
+    hist = [h["action"] for h in database.conflicts.find_one({"conflict_id": cid})["history"]]
+    assert hist == ["created", "evidence_submitted", "evidence_approved", "resolved"]
+
+
+def test_rejected_evidence_resubmission_and_separation_of_duties_on_atlas(real, api):
+    _, database = real
+    pid, cid = raise_conflict(database, "age", 40, 41)
+    cli, cu = actor(database, "clinician")
+    assert cli.post(f"/api/conflicts/{cid}/evidence", json={"reference": "DOC-B1", "description": "synthetic", "claimed_value": 41}).status_code == 200
+    own = cli.post(f"/api/conflicts/{cid}/evidence/DOC-B1/review", json={"decision": "approve", "review_note": "mine", "approved_value": 41})
+    assert own.status_code == 403 and code(own) == "separation_of_duties"
+    other, _ = actor(database, "clinician")
+    assert other.post(f"/api/conflicts/{cid}/evidence/DOC-B1/review", json={"decision": "reject", "review_note": "unreadable"}).status_code == 200
+    again = other.post(f"/api/conflicts/{cid}/evidence", json={"reference": "DOC-B1", "description": "synthetic", "claimed_value": 41})
+    assert again.status_code == 409 and code(again) == "evidence_reference_already_used"     # was HTTP 500 before Milestone 3
+    assert database.evidence.count_documents({"conflict_id": cid}) == 1
+
+
+def test_patient_confirmation_and_account_linking_on_atlas(real, api):
+    _, database = real
+    p1, cid = raise_conflict(database, "phone", "9111111111", "9222222222")
+    p2 = new_pid(); w, _ = actor(database, "worker"); sync(w, create(p2))
+    sup, su = actor(database, "supervisor")
+    pat1 = {"_id": ObjectId(), "role": "patient", "email": f"p1-{secrets.token_hex(3)}@example.com", "name": "p1", "active": True}
+    pat2 = {"_id": ObjectId(), "role": "patient", "email": f"p2-{secrets.token_hex(3)}@example.com", "name": "p2", "active": True}
+    database.users.insert_many([dict(pat1), dict(pat2)])
+    body = {"identity_verified": True, "identity_check_method": "in_person_document", "identity_check_note": "checked a paper document"}
+    assert sup.post(f"/api/admin/patients/{p1}/link-account", json={"email": pat1["email"], **body}).status_code == 200
+    assert sup.post(f"/api/admin/patients/{p2}/link-account", json={"email": pat2["email"], **body}).status_code == 200
+    again = sup.post(f"/api/admin/patients/{p2}/link-account", json={"email": pat1["email"], **body})
+    assert again.status_code == 409 and code(again) == "account_already_linked"
+    assert database.users.find_one({"_id": pat1["_id"]})["linked_patient_id"] == p1
+    with pytest.raises(DuplicateKeyError):                                            # the DATABASE refuses a second link, not only our code
+        database.users.update_one({"_id": pat2["_id"]}, {"$set": {"linked_patient_id": p1}})
+    pu1 = {**pat1, "linked_patient_id": p1}; pu2 = {**pat2, "linked_patient_id": p2}
+    main.app.dependency_overrides[security.current_user] = lambda: pu2
+    other = TestClient(main.app).post(f"/api/patients/{p1}/confirm-field", json={"conflict_id": cid, "confirmed_value": "9222222222"})
+    assert other.status_code == 403 and code(other) == "not_your_record"                 # patient 2 cannot confirm patient 1's information
+    main.app.dependency_overrides[security.current_user] = lambda: pu1
+    mine = TestClient(main.app)
+    assert [c["conflict_id"] for c in mine.get("/api/me/conflicts").json()["conflicts"]] == [cid]
+    assert mine.post(f"/api/patients/{p1}/confirm-field", json={"conflict_id": cid, "confirmed_value": "9222222222"}).status_code == 200
+    assert code(mine.post(f"/api/patients/{p1}/confirm-field", json={"conflict_id": cid, "confirmed_value": "9111111111"})) == "already_confirmed"
+    assert database.patients.find_one({"patient_id": p1})["phone"] == "9111111111"          # confirmation alone changes nothing
+    conf = database.patient_confirmations.find_one({"conflict_id": cid})
+    main.app.dependency_overrides[security.current_user] = lambda: su
+    ok = TestClient(main.app).post(f"/api/conflicts/{cid}/resolve", json={"resolution": "apply_confirmation", "patient_confirmation_id": conf["confirmation_id"], "expected_field_version": fv(database, p1, "phone")})
+    assert ok.status_code == 200 and database.patients.find_one({"patient_id": p1})["phone"] == "9222222222"
+
+
+def test_duplicate_pending_conflicts_are_prevented_by_the_database_on_atlas(real, api):
+    _, database = real
+    pid, cid = raise_conflict(database, "condition", "A", "B")
+    w, _ = actor(database, "worker")
+    again = sync(w, op("op-" + secrets.token_hex(6), pid, "device-C", 1, condition="B"))[0]
+    assert again["conflicts"][0]["conflict_id"] == cid and again["conflicts"][0]["existing"] is True
+    assert database.conflicts.count_documents({"patient_id": pid, "status": "pending"}) == 1
+    existing = database.conflicts.find_one({"conflict_id": cid})
+    dup = {k: v for k, v in existing.items() if k != "_id"}; dup["conflict_id"] = "CF-DUP-" + secrets.token_hex(4)
+    with pytest.raises(DuplicateKeyError):
+        database.conflicts.insert_one(dup)                                              # even a racing writer cannot create a 2nd pending twin
+
+
+class _FailingAudit:
+    def insert_one(self, *a, **k): raise main.PyMongoError("injected failure at the last write of the resolution")
+
+
+class _DbWithFailingAudit:
+    def __init__(self, real_db): self._db = real_db
+    def __getattr__(self, name): return _FailingAudit() if name == "audit" else getattr(self._db, name)
+
+
+def test_resolution_transaction_rolls_back_completely_on_atlas(real, api, monkeypatch):
+    _, database = real
+    pid, cid = raise_conflict(database, "dosage", "10 mg", "20 mg")
+    cli, _ = actor(database, "clinician"); v = fv(database, pid, "dosage")
+    before = (database.patients.find_one({"patient_id": pid})["version"], database.changes.count_documents({"patient_id": pid}), len(database.conflicts.find_one({"conflict_id": cid})["history"]))
+    monkeypatch.setattr(main, "db", _DbWithFailingAudit(database))
+    r = cli.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_incoming", "expected_field_version": v})
+    monkeypatch.setattr(main, "db", database)
+    assert r.status_code == 503 and code(r) == "transaction_failed"
+    after = (database.patients.find_one({"patient_id": pid})["version"], database.changes.count_documents({"patient_id": pid}), len(database.conflicts.find_one({"conflict_id": cid})["history"]))
+    assert after == before                                                              # MongoDB itself rolled back patient, feed and conflict updates
+    assert database.patients.find_one({"patient_id": pid})["dosage"] == "10 mg" and database.conflicts.find_one({"conflict_id": cid})["status"] == "pending"
+    assert cli.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_incoming", "expected_field_version": v}).status_code == 200
+
+
+def test_resolution_audit_and_history_persist_with_actor_and_values_on_atlas(real, api):
+    _, database = real
+    pid, cid = raise_conflict(database, "condition", "Hypertension", "Diabetes")
+    cli, cu = actor(database, "clinician")
+    assert cli.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "custom", "selected_value": "Hypertension stage 1", "note": "reassessed", "expected_field_version": fv(database, pid, "condition")}).status_code == 200
+    rec = database.audit.find_one({"patient_id": pid, "event_type": "CONFLICT_RESOLVED"})
+    assert rec["actor_id"] == str(cu["_id"]) and rec["actor_role"] == "clinician" and rec["created_at"]
+    assert rec["metadata"]["old_value"] == "Hypertension" and rec["metadata"]["new_value"] == "Hypertension stage 1" and rec["metadata"]["category"] == "CRITICAL_CLINICAL"
+    h = database.conflicts.find_one({"conflict_id": cid})["history"]
+    assert [x["action"] for x in h] == ["created", "resolved"] and h[-1]["actor_id"] == str(cu["_id"]) and h[-1]["new_value"] == "Hypertension stage 1"
+    blob = str(list(database.audit.find({"patient_id": pid}))).lower()
+    assert "password" not in blob and "eyj" not in blob
 
 
 # 6 ------------------------------------------------------------------------------------------------------------

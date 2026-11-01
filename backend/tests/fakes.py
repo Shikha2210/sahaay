@@ -35,23 +35,63 @@ from types import SimpleNamespace
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
 
+def _get(doc, dotted):
+    cur = doc
+    for part in dotted.split("."):
+        if isinstance(cur, list):
+            try: cur = cur[int(part)]
+            except (ValueError, IndexError): return _MISSING
+        elif isinstance(cur, dict) and part in cur: cur = cur[part]
+        else: return _MISSING
+    return cur
+
+
+_MISSING = object()
+
+
+def _match(doc, query):
+    """Tiny subset of Mongo query matching: equality, dotted keys, $in, $ne, $exists, $regex-free."""
+    for key, cond in (query or {}).items():
+        val = _get(doc, key)
+        if isinstance(cond, dict) and any(k.startswith("$") for k in cond):
+            for op, arg in cond.items():
+                if op == "$in" and not (val is not _MISSING and val in arg): return False
+                if op == "$ne" and val == arg: return False
+                if op == "$exists" and (val is not _MISSING) != bool(arg): return False
+                if op == "$type" and not (val is not _MISSING and isinstance(val, str)): return False
+        elif val is _MISSING or val != cond:
+            return False
+    return True
+
+
+class _Cursor(list):
+    def sort(self, key, direction=1):
+        super().sort(key=lambda d: (d.get(key) is None, d.get(key)), reverse=(direction == -1)); return self
+    def limit(self, n): return _Cursor(self[:n])
+
+
 class MemCollection:
     def __init__(self, unique=None):
         self.docs, self.unique = [], unique
 
     def find_one(self, query=None, **kw):
         for d in self.docs:
-            if all(d.get(k) == v for k, v in (query or {}).items()):
-                return d
+            if _match(d, query): return d
         return None
+
+    def find(self, query=None, *a, **kw):
+        return _Cursor(d for d in self.docs if _match(d, query))
 
     def insert_one(self, doc, **kw):
         if self.unique and any(d.get(self.unique) == doc.get(self.unique) for d in self.docs):
             raise DuplicateKeyError(f"duplicate {self.unique}")
+        doc.setdefault("_id", ObjectId())
         self.docs.append(doc)
 
     def update_one(self, flt, update, **kw):
         d = self.find_one(flt)
+        if d is None and kw.get("upsert") and "$setOnInsert" in update:
+            self.docs.append(dict(update["$setOnInsert"])); return SimpleNamespace(matched_count=0, modified_count=0)
         if d is None:
             return SimpleNamespace(matched_count=0, modified_count=0)
         for key, val in update.get("$set", {}).items():
@@ -60,6 +100,8 @@ class MemCollection:
             for p in parts[:-1]:
                 target = target.setdefault(p, {})
             target[parts[-1]] = val
+        for key, val in update.get("$push", {}).items():
+            d.setdefault(key, []).append(val)
         return SimpleNamespace(matched_count=1, modified_count=1)
 
     def find_one_and_update(self, flt, update, **kw):
@@ -69,18 +111,29 @@ class MemCollection:
         return d
 
     def count_documents(self, query=None, **kw):
-        return sum(1 for d in self.docs if all(d.get(k) == v for k, v in (query or {}).items()))
+        return sum(1 for d in self.docs if _match(d, query))
+
+
+class _UniqueTuple(MemCollection):
+    """Collection with a composite unique key (mirrors the real unique indexes on evidence and patient_confirmations)."""
+    def __init__(self, keyfn): super().__init__(); self.keyfn = keyfn
+    def insert_one(self, doc, **kw):
+        if any(self.keyfn(d) == self.keyfn(doc) for d in self.docs): raise DuplicateKeyError("duplicate key")
+        doc.setdefault("_id", ObjectId())
+        self.docs.append(doc)
 
 
 class MemMongo:
     """Holds the collections the sync code touches and plays the role of both `db` and `client`."""
-    names = ("patients", "operations", "changes", "audit", "conflicts", "counters", "users")
+    names = ("patients", "operations", "changes", "audit", "conflicts", "counters", "users", "evidence", "patient_confirmations")
 
     def __init__(self):
         self.patients = MemCollection("patient_id")
         self.operations = MemCollection("operation_id")
         self.changes, self.audit, self.conflicts, self.users = (MemCollection() for _ in range(4))
         self.counters = MemCollection()
+        self.evidence = _UniqueTuple(lambda d: (d.get('conflict_id'), d.get('evidence_reference')))
+        self.patient_confirmations = _UniqueTuple(lambda d: (d.get('conflict_id'), d.get('user_id')))
         self.counters.docs.append({"_id": "global_change_seq", "value": 0})
         self.fail_commit = False
         self._writes = 0

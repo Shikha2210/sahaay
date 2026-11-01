@@ -56,7 +56,8 @@ def current_user(token: str = Depends(oauth)):
 
 def require_roles(*roles):
     def dependency(user=Depends(current_user)):
-        if user['role'] not in roles: raise HTTPException(403, 'Insufficient role permissions')
+        if user['role'] not in roles:
+            raise HTTPException(403, {'code': 'role_not_permitted', 'message': 'Your role is not permitted to do this.', 'required_roles': sorted(roles)})
         return user
     return dependency
 

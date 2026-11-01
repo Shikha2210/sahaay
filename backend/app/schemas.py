@@ -73,10 +73,44 @@ class BatchIn(BaseModel):
     operations: list[OperationIn] = Field(max_length=100)
 
 class ResolveIn(BaseModel):
-    resolution: str = Field(min_length=2, max_length=2000)
-    selected_value: Any = None
-    evidence_reference: str | None = None
-    patient_confirmation_id: str | None = None
+    """Body of POST /api/conflicts/{id}/resolve. Which resolutions are allowed depends on the conflict category and the
+    caller's role (see documentation/CONFLICT_POLICY.md). The VALUE of apply_evidence / apply_confirmation always comes
+    from the stored approved evidence / patient confirmation, never from the caller."""
+    model_config = ConfigDict(extra='forbid')
+    resolution: str = Field(min_length=2, max_length=40)
+    expected_field_version: int | None = Field(default=None, ge=0)   # the field version the reviewer was looking at
+    selected_value: Any = None                                      # only for resolution == "custom"
+    evidence_reference: str | None = Field(default=None, max_length=100)
+    patient_confirmation_id: str | None = Field(default=None, max_length=64)
+    note: str | None = Field(default=None, max_length=500)
+
+
+class EvidenceSubmitIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    reference: str = Field(pattern=r'^[A-Za-z0-9_.:#-]{3,100}$')    # a reference to a document held elsewhere (no file upload)
+    description: str = Field(min_length=3, max_length=1000)
+    claimed_value: Any = Field(...)                                 # what the submitter says the document shows
+
+
+class EvidenceReviewIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    decision: Literal['approve', 'reject']
+    review_note: str = Field(min_length=3, max_length=500)
+    approved_value: Any = None                                      # REQUIRED when approving: the exact value the clinician certifies
+
+
+class ConfirmIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    conflict_id: str = Field(min_length=3, max_length=64)
+    confirmed_value: Any = Field(...)
+
+
+class LinkAccountIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    email: EmailStr
+    identity_verified: bool                                         # supervisor attests an out-of-band identity check was done
+    identity_check_method: Literal['in_person_document', 'trusted_introduction', 'other']
+    identity_check_note: str = Field(min_length=5, max_length=500)
 
 
 class IdentityAttemptIn(BaseModel):

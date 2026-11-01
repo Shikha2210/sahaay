@@ -20,5 +20,12 @@ def init_db():
     db.evidence.create_index([('evidence_reference', ASCENDING), ('conflict_id', ASCENDING)], unique=True)
     db.patient_confirmations.create_index([('confirmation_id', ASCENDING)], unique=True)
     db.patient_confirmations.create_index([('conflict_id', ASCENDING), ('user_id', ASCENDING)], unique=True)
+    db.conflicts.create_index([('patient_id', ASCENDING), ('status', ASCENDING)])
+    # One PENDING conflict per (patient, field, proposed value): repeated syncs of the same competing value cannot pile up (C9).
+    db.conflicts.create_index([('patient_id', ASCENDING), ('field', ASCENDING), ('dedupe_key', ASCENDING)], unique=True, name='uniq_pending_conflict',
+                              partialFilterExpression={'status': 'pending', 'dedupe_key': {'$type': 'string'}})
+    # A patient record can be linked to at most one account (C10); enforced by the database, not only by application checks.
+    db.users.create_index([('linked_patient_id', ASCENDING)], unique=True, name='uniq_linked_patient',
+                          partialFilterExpression={'linked_patient_id': {'$type': 'string'}})
     db.counters.update_one({'_id':'global_change_seq'}, {'$setOnInsert':{'value':0}}, upsert=True)
     return True

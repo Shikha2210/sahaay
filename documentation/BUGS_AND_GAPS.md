@@ -153,3 +153,8 @@ Full evidence and reproduction steps in `MILESTONE_2C_REPORT.md`.
 * **New / re-prioritised:** C5 (stale conflict overwrote newer dosage, **High, clinical**), C6 (HTTP 500 on evidence resubmission, confirmed), C3/C4 (supervisor resolved a document conflict with an arbitrary value, confirmed), C1/C2/F1/X8/S5/S11/X5 confirmed in the running app; S9 refined: manual "Sync now" and the auto-sync timer can upload the same operation concurrently (safe because of server idempotency).
 * **Fixed bugs verified live on Atlas:** S1, S3, S4, ordering (S2), idempotent replay, lost-acknowledgement recovery, X1/X2/X3/X4, bootstrap and index creation.
 * **Operational:** synthetic accounts/records (`ZZ-SYNTHETIC ...`) now exist in the real `sahaay` database; there is no delete/deactivate endpoint.
+
+---
+# Status after Milestone 3 (2026-11-02) — conflict engine
+C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11: **FIXED** (details, root causes, tests: `MILESTONE_3_REPORT.md`; policy: `CONFLICT_POLICY.md`). Verified with 32 in-memory logic tests, 5 contract tests, 19 real-Atlas integration tests and a 23-check real-browser run on a disposable database.
+Still open / newly noted: patient UI to confirm (API ready), worker evidence submission UI + conflict notices (S11), link-account UI, clinician dashboard, no unlink flow for mistaken links, evidence is a reference only, patient may choose only between the two proposed values, any field change forces re-review, X5/X7 unchanged.

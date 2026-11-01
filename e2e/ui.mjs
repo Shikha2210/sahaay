@@ -23,7 +23,7 @@ export function readEnv() {
   }
   return out;
 }
-export const state = () => JSON.parse(fs.readFileSync(path.join(here, '.e2e_state.json'), 'utf8'));
+export const state = () => JSON.parse(fs.readFileSync(process.env.E2E_STATE || path.join(here, '.e2e_state.json'), 'utf8'));
 
 export class Report {
   constructor(name) { this.name = name; this.rows = []; }

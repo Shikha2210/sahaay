@@ -1,3 +1,5 @@
+> **SUPERSEDED in Milestone 3.** This describes the old workflow. See `CONFLICT_POLICY.md` for the current rules and API.
+
 # SAHAAY conflict-resolution workflows — next implementation stage
 
 This package extends the existing v3 project with category-specific workflow records.

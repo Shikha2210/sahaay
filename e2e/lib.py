@@ -1,6 +1,7 @@
 """Shared helpers for the E2E scripts. Reads backend/.env at run time; NEVER prints secrets.
 Run with the backend venv:  backend\\.venv\\Scripts\\python.exe e2e\\phaseN_*.py   (backend must be running on :8000)"""
 import json
+import os
 import pathlib
 import secrets
 import sys
@@ -14,12 +15,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ENV = dotenv_values(ROOT / "backend" / ".env")
 API = "http://127.0.0.1:8000"
 SYNTH = "ZZ-SYNTHETIC"          # every record created by these scripts is labelled with this prefix
-STATE_FILE = pathlib.Path(__file__).resolve().parent / ".e2e_state.json"   # git-ignored (holds synthetic passwords)
+STATE_FILE = pathlib.Path(os.environ.get("E2E_STATE") or (pathlib.Path(__file__).resolve().parent / ".e2e_state.json"))   # git-ignored (holds synthetic passwords)
 
 
 def mongo():
     c = MongoClient(ENV["MONGODB_URI"], server_api=ServerApi("1"), serverSelectionTimeoutMS=15000)
-    return c, c[ENV["MONGODB_DATABASE"]]
+    return c, c[os.environ.get("E2E_DATABASE") or ENV["MONGODB_DATABASE"]]   # E2E_DATABASE lets a run use a disposable database
 
 
 def http():

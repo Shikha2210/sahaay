@@ -93,7 +93,7 @@ Legend: **Full** fully implemented · **Partial** · **FE** frontend only · **B
 | 1 | Consolidate repo (frontend + backend) | **Done** 2026-11-01 — see TEST_REPORT_M1.md. Atlas run pending (blocker) |
 | 2b | Sync correctness S1-S4 | **Done and verified on real Atlas** (10/10 integration tests, 2026-11-01). Not yet tested on Atlas: HTTP login flow, pull feed, bootstrap, browser UI |
 | 2 | Security & auth (part of backend correctness) | **Done 2026-11-01** (code-only; Atlas-dependent verification **blocked**). Sync/transaction fixes (S1–S4) deferred to next milestone |
-| 3 | Conflict engine | Not started |
+| 3 | Conflict engine | **Done 2026-11-02** — C1–C11 fixed; see MILESTONE_3_REPORT.md. UI for patient/worker/link-account still to do (M5) |
 | 4 | Offline sync rework | Not started |
 | 5 | Frontend workflows (all 4 roles) | Not started |
 | 6 | Security hardening | Not started |
@@ -128,3 +128,6 @@ Changes to existing behaviour to be aware of: tokens now expire after 60 min (wa
 
 ## Milestone 2C result (2026-11-01) — real end-to-end verification
 See `MILESTONE_2C_REPORT.md`. Executed against the real backend, real Atlas `sahaay` database and real browser: **222 checks passed, 15 failed (≈11 distinct genuine defects), 2 notes**. Verified working: bootstrap, indexes, HTTP auth, role matrix, session expiry/logout/user-switch protection, offline create, reconnect sync, pull feed, idempotency, lost-ack recovery, retry/back-off, conflict detection for all four categories without last-write-wins, clinician-only enforcement. Not working / missing: clinician and patient workspaces, patient confirmation endpoint, UI conflict resolution, value binding to evidence, stale-conflict guard, failed-operations UI. **Demo readiness: sync demo yes; full 12-step demo no.** Milestone 3 not started.
+
+## Milestone 3 result (2026-11-02) — conflict engine safety and correctness
+Server-enforced policy per category; stale-version guard (`expected_field_version`) with atomic conditional updates; evidence records the clinician's exact approved value and resolutions copy it; patient confirmation endpoint (own record only); reject outcome + conflict history; duplicate-pending prevention and one-account-per-record enforced by partial unique indexes; structured errors everywhere. Tests: backend 116 passed (+19 real-Atlas passed), frontend 40 passed, build passed, browser workflow 23/23 on a disposable database; real `sahaay` untouched. Not started: Milestone 4 and any unrelated features.

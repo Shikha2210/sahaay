@@ -50,3 +50,7 @@ FastAPI default `{"detail": "..."}`; validation errors return 422 with a list. T
 `conflicts{conflict_id*, patient_id, field, category, value_a, value_b, status, resolution…, synthetic?}` ·
 `evidence{(evidence_reference,conflict_id)*, status, reviewed_by…}` · `patient_confirmations{confirmation_id*, (conflict_id,user_id)*}` (never written) ·
 `audit{patient_id, actor_id, actor_role, event_type, description, metadata, created_at}` · `identity_attempts` · `chat_messages`. (`*` unique index.)
+
+---
+# Conflict API — replaced in Milestone 3
+The conflict, evidence, confirmation and account-linking rows in the table above describe the OLD contract. The current contract (JSON bodies, structured errors, `expected_field_version`, new resolution names, `GET /api/conflicts/{id}`, `GET /api/me/conflicts`, `POST /api/patients/{id}/confirm-field`, `?status=` filter) is documented in `CONFLICT_POLICY.md`.

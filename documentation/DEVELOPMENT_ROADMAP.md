@@ -83,3 +83,6 @@ Move/delete folders (M1), change token storage (M6), drop collections/migrate ex
 
 ## Update after M2b
 * S1-S4 code complete. Next: run `tests/test_atlas_integration.py` against Atlas (needs `backend/.env`), fix whatever it reveals, then Milestone 3 (conflict engine: C1 patient confirmation, C2/C3 resolve flow) only when approved.
+
+## Update after M3
+M3 (conflict engine) complete. Next (needs your go-ahead): M4 offline-sync client rework remains as planned; UI items listed in MILESTONE_3_REPORT.md section 7 belong to M5.
