@@ -5,16 +5,20 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { CalendarDays, FileText, HeartPulse, Info, ShieldCheck, ArrowUpRight } from 'lucide-react';
 import { api } from './api';
 import { AiExplain } from './AiParts';
+import { cachedApi, friendlyError } from './offlineCache';
+import useOnline from './useOnline';
+import { StaleNotice, NeedsConnection } from './Notices';
 import { label, show, fmtDate, greeting } from './fieldLabels';
 
 const RECORD_FIELDS = ['name', 'age', 'phone', 'village', 'condition', 'diagnosis', 'medications', 'allergies', 'treatment_plan', 'blood_pressure', 'blood_glucose', 'dosage', 'last_visit'];
 
 function usePatientData() {
-  const [s, setS] = useState({ loading: true, error: '', linked: null, pid: null, record: null, conflicts: [] });
+  const [s, setS] = useState({ loading: true, error: '', linked: null, pid: null, record: null, conflicts: [], stale: false, fetchedAt: null });
   const load = useCallback(async () => {
     try {
-      const [r, c] = await Promise.all([api('/api/me/record'), api('/api/me/conflicts?status=all')]);
-      setS({ loading: false, error: '', linked: r.linked, pid: r.patient_id, record: r.record || null, conflicts: c.conflicts || [] });
+      const [rr, cc] = await Promise.all([cachedApi('/api/me/record'), cachedApi('/api/me/conflicts?status=all')]);   // falls back to the copy saved on this device when offline
+      const r = rr.data, c = cc.data;
+      setS({ loading: false, error: '', linked: r.linked, pid: r.patient_id, record: r.record || null, conflicts: c.conflicts || [], stale: rr.stale || cc.stale, fetchedAt: rr.fetchedAt || cc.fetchedAt });
     } catch (e) {
       setS(prev => ({ ...prev, loading: false, error: e.code === 'network' ? 'You appear to be offline. Your record needs a connection to load.' : e.message }));
     }
@@ -38,6 +42,7 @@ function activity(conflicts) {
 export default function PatientWorkspace({ mode, setPage, notify, onChanged, ui }) {
   const { Head, Metric, Panel, Timeline, Badge } = ui;
   const d = usePatientData();
+  const online = useOnline();
   const [ask, setAsk] = useState(null), [busy, setBusy] = useState(false), [err, setErr] = useState('');
 
   if (d.loading) return <div className="content"><Head eyebrow="PATIENT SPACE" title="Loading your information…" sub="" /></div>;
@@ -54,10 +59,11 @@ export default function PatientWorkspace({ mode, setPage, notify, onChanged, ui 
     try {
       await api('/api/patients/' + encodeURIComponent(d.pid) + '/confirm-field', { method: 'POST', body: JSON.stringify({ conflict_id: c.conflict_id, confirmed_value: value }) });
       notify('Thank you - your confirmation was recorded.'); setAsk(null); await d.reload(); if (onChanged) onChanged();
-    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e) { setErr(friendlyError(e)); } finally { setBusy(false); }
   }
+  const staleBanner = d.stale ? <StaleNotice fetchedAt={d.fetchedAt} /> : null;
 
-  if (mode === 'confirmations') return <div className="content">
+  if (mode === 'confirmations') return <div className="content">{staleBanner}
     <Head eyebrow="CONFIRM YOUR INFORMATION" title="Help us keep your record correct" sub="When two different values were recorded for the same detail, you can tell us which one is right. Your care team then applies your answer." />
     {err && <div className="disclaimer" role="alert">{err}</div>}
     {pending.length === 0 && <div className="info-card"><ShieldCheck /><p>Nothing needs your confirmation right now.</p></div>}
@@ -71,8 +77,9 @@ export default function PatientWorkspace({ mode, setPage, notify, onChanged, ui 
             <p>Two different values are on file. Choose the one that is correct for you.</p>
             <AiExplain conflictId={c.conflict_id} />
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8 }}>
-              {[c.value_a, c.value_b].map((v, i) => <button key={i} className="outline-btn" disabled={busy} onClick={() => { setErr(''); setAsk({ c, value: v }); }}>{i === 0 ? 'Currently on file: ' : 'Also reported: '}<b>{show(v)}</b></button>)}
+              {[c.value_a, c.value_b].map((v, i) => <button key={i} className="outline-btn" disabled={busy || !online} onClick={() => { setErr(''); setAsk({ c, value: v }); }}>{i === 0 ? 'Currently on file: ' : 'Also reported: '}<b>{show(v)}</b></button>)}
             </div>
+            {!online && <NeedsConnection>Confirming needs a connection so your answer reaches your care team. You can read your information offline.</NeedsConnection>}
             {ask && ask.c.conflict_id === c.conflict_id && <div className="modal-note" role="alertdialog" style={{ marginTop: 10 }}>
               <p>Confirm that <b>{show(ask.value)}</b> is the correct {label(c.field).toLowerCase()}?</p>
               <div style={{ display: 'flex', gap: 8 }}>
@@ -88,7 +95,7 @@ export default function PatientWorkspace({ mode, setPage, notify, onChanged, ui 
         <Badge tone={c.status === 'resolved' ? 'green' : 'neutral'}>{c.status === 'resolved' ? 'Applied' : 'Not applied'}</Badge></div>)}</div></Panel>}
   </div>;
 
-  if (mode === 'record') return <div className="content">
+  if (mode === 'record') return <div className="content">{staleBanner}
     <Head eyebrow="PERSONAL HEALTH" title="Your health record" sub="The information your care team holds about you." />
     <div className="grid-two">
       <Panel title="Health profile" sub={`Patient ID · ${d.pid}`}>
@@ -104,7 +111,7 @@ export default function PatientWorkspace({ mode, setPage, notify, onChanged, ui 
     {needs.length > 0 && <div className="info-card"><Info /><p>{needs.length} detail{needs.length === 1 ? '' : 's'} on your record need{needs.length === 1 ? 's' : ''} your confirmation. <button className="text-btn" onClick={() => setPage('confirmations')}>Review now <ArrowUpRight size={14} /></button></p></div>}
   </div>;
 
-  return <div className="content">
+  return <div className="content">{staleBanner}
     <Head eyebrow={`PATIENT SPACE · ${greeting()}`} title="Your health, at a glance." sub="A clear view of your own record. Your information stays yours." action={<button className="gradient-btn" onClick={() => setPage('assistant')}>Ask SAHAAY AI</button>} />
     <div className="metric-grid">
       <Metric label="Your record" value={d.pid} change="Linked to your account" I={HeartPulse} />

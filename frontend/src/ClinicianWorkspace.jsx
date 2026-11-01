@@ -5,17 +5,20 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, ClipboardList, FileCheck2, Info, ShieldCheck, Stethoscope } from 'lucide-react';
 import { api } from './api';
+import { cachedApi, friendlyError } from './offlineCache';
+import { StaleNotice } from './Notices';
 import ConflictReview, { ConflictDialog } from './ConflictReview';
+import AuditHistory from './AuditHistory';
 import { label, show, fmtDate, CATEGORY_LABEL } from './fieldLabels';
 
 export default function ClinicianWorkspace({ page, role, conflicts, refresh, notify, ui }) {
   const { Head, Metric, Panel, Badge, Modal } = ui;
-  const [openId, setOpenId] = useState(null), [queue, setQueue] = useState(null), [history, setHistory] = useState(null), [err, setErr] = useState('');
+  const [openId, setOpenId] = useState(null), [queue, setQueue] = useState(null), [history, setHistory] = useState(null), [err, setErr] = useState(''), [stale, setStale] = useState(null);
 
-  const loadQueue = useCallback(async () => { try { setQueue(await api('/api/evidence?status=pending_review')); setErr(''); } catch (e) { setErr(e.code === 'network' ? 'You appear to be offline. Some lists need a connection.' : e.message); } }, []);
+  const loadQueue = useCallback(async () => { try { const r = await cachedApi('/api/evidence?status=pending_review'); setQueue(r.data); if (r.stale) setStale(r); else setStale(null); setErr(''); } catch (e) { setErr(friendlyError(e)); } }, []);
   const loadHistory = useCallback(async () => {
-    try { const [a, b] = await Promise.all([api('/api/conflicts?status=resolved'), api('/api/conflicts?status=rejected')]); setHistory([...a, ...b].sort((x, y) => ((x.resolved_at || '') < (y.resolved_at || '') ? 1 : -1))); setErr(''); }
-    catch (e) { setErr(e.code === 'network' ? 'You appear to be offline. Some lists need a connection.' : e.message); }
+    try { const [a, b] = await Promise.all([cachedApi('/api/conflicts?status=resolved'), cachedApi('/api/conflicts?status=rejected')]); setHistory([...a.data, ...b.data].sort((x, y) => ((x.resolved_at || '') < (y.resolved_at || '') ? 1 : -1))); if (a.stale || b.stale) setStale(a.stale ? a : b); setErr(''); }
+    catch (e) { setErr(friendlyError(e)); }
   }, []);
   useEffect(() => { loadQueue(); if (page === 'history') loadHistory(); }, [page, loadQueue, loadHistory]);
   const changed = async () => { await refresh(); await loadQueue(); if (page === 'history') await loadHistory(); };
@@ -24,10 +27,12 @@ export default function ClinicianWorkspace({ page, role, conflicts, refresh, not
   const pending = conflicts.filter(c => c.status === 'pending');
   const by = cat => pending.filter(c => c.category === cat);
 
+  if (page === 'audit') return <AuditHistory role="clinician" ui={ui} />;
   if (page === 'conflicts') return <ConflictReview role={role} conflicts={conflicts} refresh={changed} notify={notify} Head={Head} Badge={Badge} Modal={Modal} />;
 
   if (page === 'evidence') return <div className="content">
     <Head eyebrow="EVIDENCE REVIEW" title="Evidence waiting for your review" sub="Healthcare workers submit references to supporting documents. You record the exact value the evidence supports; you cannot review evidence you submitted yourself." />
+    {stale && <StaleNotice fetchedAt={stale.fetchedAt} />}
     {err && <div className="disclaimer" role="alert">{err}</div>}
     {queue && queue.length === 0 && <div className="info-card"><ShieldCheck /><p>No evidence is waiting for review.</p></div>}
     {(queue || []).map(e => <div className="conflict-card" key={e.conflict_id + e.evidence_reference}>

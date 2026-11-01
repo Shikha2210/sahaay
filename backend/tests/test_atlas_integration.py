@@ -569,3 +569,61 @@ def test_ai_chat_stores_nothing_and_removes_identifiers_on_atlas(real, api, ai_d
     assert "ZZ-QUESTION-NEVER-STORED" not in text and ai_double.reply not in text
     assert "chat_messages" not in database.list_collection_names() or database.chat_messages.count_documents({"user_id": str(u["_id"])}) == 0
     assert c.post("/api/chatbot/message", json={"message": "I have chest pain"}).json()["emergency"] is True and len(ai_double.calls) == 1
+
+
+# ===================================================================================== Milestone 6: audit history on REAL Atlas
+def _real_login_account(database, role="supervisor"):
+    from app.security import hash_password
+    email = f"m6-{secrets.token_hex(3)}@example.com"
+    database.users.insert_one({"_id": ObjectId(), "role": role, "email": email, "name": "ZZ-SYNTHETIC M6", "active": True, "password_hash": hash_password("Correct-Horse-9!"), "created_at": "2026-11-01"})
+    return email
+
+
+def test_login_logout_and_failed_login_are_audited_on_atlas_and_filterable(real):
+    _, database = real
+    from app.security import login_limiter
+    login_limiter._fails.clear(); main._blocked_logged.clear(); main.app.dependency_overrides.clear()
+    sup_email = _real_login_account(database, "supervisor")
+    anon = TestClient(main.app)
+    assert anon.post("/api/auth/login", json={"email": sup_email, "password": "wrong-password-1"}).status_code == 401
+    ok = anon.post("/api/auth/login", json={"email": sup_email, "password": "Correct-Horse-9!"})
+    assert ok.status_code == 200
+    h = {"Authorization": "Bearer " + ok.json()["access_token"]}
+    assert anon.post("/api/auth/logout", headers=h).status_code == 200
+    events = {d["event_type"] for d in database.audit.find({"event_type": {"$in": ["LOGIN_SUCCESS", "LOGIN_FAILED", "LOGOUT"]}})}
+    assert {"LOGIN_SUCCESS", "LOGIN_FAILED", "LOGOUT"} <= events
+    stored = _json.dumps(list(database.audit.find({}, {"_id": 0})), default=str)
+    assert "wrong-password-1" not in stored and "Correct-Horse-9!" not in stored and ok.json()["access_token"] not in stored
+    ok2 = anon.post("/api/auth/login", json={"email": sup_email, "password": "Correct-Horse-9!"})
+    h2 = {"Authorization": "Bearer " + ok2.json()["access_token"]}
+    r = anon.get("/api/audit?event_type=LOGIN_FAILED,LOGOUT&page_size=1", headers=h2).json()
+    assert r["total"] >= 2 and len(r["items"]) == 1 and r["has_more"] is True and {i["event_type"] for i in r["items"]} <= {"LOGIN_FAILED", "LOGOUT"}
+    page2 = anon.get("/api/audit?event_type=LOGIN_FAILED,LOGOUT&page_size=1&page=2", headers=h2).json()
+    assert page2["items"] and page2["items"][0] != r["items"][0]
+
+
+def test_audit_security_events_hidden_from_clinicians_and_workers_denied_on_atlas(real):
+    _, database = real
+    from app.security import login_limiter
+    login_limiter._fails.clear(); main.app.dependency_overrides.clear()
+    clin, work = _real_login_account(database, "clinician"), _real_login_account(database, "worker")
+    c = TestClient(main.app)
+    tc = c.post("/api/auth/login", json={"email": clin, "password": "Correct-Horse-9!"}).json()["access_token"]
+    tw = c.post("/api/auth/login", json={"email": work, "password": "Correct-Horse-9!"}).json()["access_token"]
+    items = c.get("/api/audit?page_size=100", headers={"Authorization": "Bearer " + tc}).json()["items"]
+    assert not {i["event_type"] for i in items} & main.SECURITY_EVENTS
+    assert c.get("/api/audit", headers={"Authorization": "Bearer " + tw}).status_code == 403
+
+
+def test_sync_summary_counts_real_operations_and_devices_on_atlas(real, api):
+    _, database = real
+    c, _ = api("worker"); pid = new_pid()
+    before = c.get("/api/sync/summary")
+    assert before.status_code == 403                                           # workers cannot see the whole-system view
+    sup, _ = actor(database, "supervisor")
+    n0 = sup.get("/api/sync/summary").json()["operations_total"]
+    main.app.dependency_overrides.clear(); worker, _ = actor(database, "worker")
+    assert worker.post("/api/sync/batch", json={"operations": [op("m6-" + secrets.token_hex(6), pid, "device-M6", 0, name="ZZ-SYNTHETIC", age=30, phone="9000000000", village="V", condition="c", medications="m", dosage="d", last_visit="2026-10-01", identity_status="UNVERIFIED", __create__=True)]}).status_code == 200
+    sup, _ = actor(database, "supervisor")
+    s = sup.get("/api/sync/summary").json()
+    assert s["operations_total"] == n0 + 1 and any(d["device_id"] == "device-M6" for d in s["devices"])

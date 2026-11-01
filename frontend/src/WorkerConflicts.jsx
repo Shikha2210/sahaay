@@ -6,14 +6,18 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { ArrowRight, Info, ShieldCheck } from 'lucide-react';
 import { api } from './api';
 import { AiExplain } from './AiParts';
+import { cachedApi, friendlyError } from './offlineCache';
+import useOnline from './useOnline';
+import { StaleNotice, NeedsConnection } from './Notices';
 import { label, show, fmtDate, CATEGORY_LABEL } from './fieldLabels';
 
 export default function WorkerConflicts({ notify, onChanged, ui }) {
   const { Head, Badge, Modal } = ui;
-  const [data, setData] = useState(null), [err, setErr] = useState(''), [tab, setTab] = useState('open'), [form, setForm] = useState(null);
+  const [data, setData] = useState(null), [stale, setStale] = useState(null), [err, setErr] = useState(''), [tab, setTab] = useState('open'), [form, setForm] = useState(null);
+  const online = useOnline();
   const load = useCallback(async () => {
-    try { setData(await api('/api/sync/conflicts?status=all')); setErr(''); }
-    catch (e) { setErr(e.code === 'network' ? 'You appear to be offline. Conflict notifications need a connection.' : e.message); }
+    try { const r = await cachedApi('/api/sync/conflicts?status=all'); setData(r.data); setStale(r.stale ? r : null); setErr(''); }
+    catch (e) { setErr(e.code === 'network' ? 'You appear to be offline and nothing has been saved on this device yet. Conflict notifications need a connection at least once.' : e.message); }
   }, []);
   useEffect(() => { load(); }, [load]);
 
@@ -23,6 +27,7 @@ export default function WorkerConflicts({ notify, onChanged, ui }) {
     <div className="toolbar"><div style={{ display: 'flex', gap: 8 }}>
       <button className={tab === 'open' ? 'gradient-btn' : 'outline-btn'} onClick={() => setTab('open')}>Open ({data?.open_count ?? 0})</button>
       <button className={tab === 'closed' ? 'gradient-btn' : 'outline-btn'} onClick={() => setTab('closed')}>Closed</button></div></div>
+    {stale && <StaleNotice fetchedAt={stale.fetchedAt} />}
     {err && <div className="info-card" role="alert"><Info /><p>{err}</p></div>}
     {data && list.length === 0 && !err && <div className="info-card"><ShieldCheck /><p>{tab === 'open' ? 'No open conflicts from your changes.' : 'No closed conflicts yet.'}</p></div>}
     {list.map(c => <div className="conflict-card" key={c.conflict_id} style={{ alignItems: 'flex-start' }}>
@@ -35,7 +40,7 @@ export default function WorkerConflicts({ notify, onChanged, ui }) {
         <AiExplain conflictId={c.conflict_id} />
         {c.status === 'pending' && c.category !== 'DOCUMENT_VERIFIABLE' && <small>{c.category === 'PATIENT_VERIFIABLE' ? 'The patient is asked to confirm the correct value.' : 'An authorized clinician will review this.'}</small>}
       </div>
-      {c.can_submit_evidence && <button className="outline-btn" onClick={() => setForm({ c, reference: '', description: '', claimed: '', error: '', busy: false })}>Submit evidence</button>}
+      {c.can_submit_evidence && <div><button className="outline-btn" disabled={!online} onClick={() => setForm({ c, reference: '', description: '', claimed: '', error: '', busy: false })}>Submit evidence</button>{!online && <NeedsConnection>Needs a connection.</NeedsConnection>}</div>}
     </div>)}
     {form && <Modal title="Submit evidence" close={() => setForm(null)}>
       <form className="modal-form" onSubmit={async e => {
@@ -44,7 +49,7 @@ export default function WorkerConflicts({ notify, onChanged, ui }) {
           const claimed = form.c.field === 'age' ? Number(form.claimed) : form.claimed.trim();
           await api('/api/conflicts/' + encodeURIComponent(form.c.conflict_id) + '/evidence', { method: 'POST', body: JSON.stringify({ reference: form.reference.trim(), description: form.description.trim(), claimed_value: claimed }) });
           notify('Evidence submitted. A clinician will review it.'); setForm(null); await load(); if (onChanged) onChanged();
-        } catch (er) { setForm(f => ({ ...f, busy: false, error: er.message })); }
+        } catch (er) { setForm(f => ({ ...f, busy: false, error: friendlyError(er) })); }
       }}>
         <div className="modal-note">For <b>{label(form.c.field)}</b> on patient <b>{form.c.patient_id}</b>. This records a <b>reference</b> to a document (for example a register entry number). It does not upload or verify the document; a clinician decides.</div>
         {form.error && <div className="disclaimer" role="alert">{form.error}</div>}

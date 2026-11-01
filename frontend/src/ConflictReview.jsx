@@ -2,9 +2,11 @@
 // The server enforces the policy (documentation/CONFLICT_POLICY.md); this screen only shows what the signed-in role may do
 // (GET /api/conflicts/{id} -> `allowed`) and sends the exact fields the API expects. No browser prompt or alert dialogs.
 import React, { useEffect, useState } from 'react';
-import { ArrowRight, ArrowUpRight, ShieldCheck, AlertTriangle } from 'lucide-react';
+import { ArrowRight, ArrowUpRight, ShieldCheck, AlertTriangle, CloudOff } from 'lucide-react';
 import { api } from './api';
 import { AiExplain, AiRecordSummary } from './AiParts';
+import { friendlyError } from './offlineCache';
+import useOnline from './useOnline';
 
 const RESOLUTIONS = ['apply_evidence', 'apply_confirmation', 'accept_current', 'accept_incoming', 'custom', 'reject_incoming'];
 export const SENT_RESOLUTIONS = RESOLUTIONS;   // used by a contract test: every value this screen can send must exist on the server
@@ -20,10 +22,12 @@ const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(bo
 
 export default function ConflictReview({ role, conflicts, refresh, notify, Head, Badge, Modal }) {
   const [openId, setOpenId] = useState(null), [cat, setCat] = useState('ALL');
+  const online = useOnline();
   const allPending = conflicts.filter(c => c.status === 'pending');
   const pending = cat === 'ALL' ? allPending : allPending.filter(c => c.category === cat);
   return <div className="content">
     <Head eyebrow="CLINICAL GOVERNANCE" title="Conflict review queue" sub="Route field conflicts according to verification policy. The server checks every decision against your role and the record's current version." />
+    {!online && <div className="info-card" role="status"><CloudOff /><p>You are offline. This queue is the copy saved on this device and may be out of date. Opening a conflict and making decisions need a connection.</p></div>}
     <div className="toolbar" style={{ gap: 8, flexWrap: 'wrap' }} role="group" aria-label="Filter by category">{[['ALL', 'All'], ['CRITICAL_CLINICAL', 'Clinical'], ['DOCUMENT_VERIFIABLE', 'Document'], ['PATIENT_VERIFIABLE', 'Patient-confirmed'], ['REQUIRES_REVIEW', 'Needs review']].map(([k, t]) => <button key={k} className={cat === k ? 'gradient-btn' : 'outline-btn'} onClick={() => setCat(k)}>{t} ({k === 'ALL' ? allPending.length : allPending.filter(c => c.category === k).length})</button>)}</div>
     {pending.length === 0 && <div className="info-card"><ShieldCheck /><p>No conflicts are waiting for review{cat === 'ALL' ? '' : ' in this category'}.</p></div>}
     {pending.map(c => <div className="conflict-card" key={c.conflict_id}>
@@ -45,16 +49,17 @@ export function ConflictDialog({ id, role, onClose, onChanged, notify, Modal, Ba
   const [d, setD] = useState(null), [err, setErr] = useState(''), [busy, setBusy] = useState(false);
   const [mode, setMode] = useState('accept_current'), [val, setVal] = useState(''), [note, setNote] = useState('');
   const [approved, setApproved] = useState({}), [reviewNote, setReviewNote] = useState({}), [ask, setAsk] = useState(null);
+  const online = useOnline();
 
   // keepMessage: after a refused decision we reload the fresh state but must NOT erase the explanation of the refusal
-  async function load(keepMessage = false) { try { setD(await api('/api/conflicts/' + encodeURIComponent(id))); if (!keepMessage) setErr(''); } catch (e) { setErr(e.message); } }
+  async function load(keepMessage = false) { try { setD(await api('/api/conflicts/' + encodeURIComponent(id))); if (!keepMessage) setErr(''); } catch (e) { setErr(friendlyError(e)); } }
   useEffect(() => { load(); }, [id]);
 
   // run an API action; on success close, on a stale/closed conflict reload the fresh state and keep the dialog open
   async function act(fn, done, { keepOpen = false } = {}) {
     setBusy(true); setErr('');
     try { await fn(); notify(done); await onChanged(); if (keepOpen) await load(); else onClose(); }
-    catch (e) { setErr(e.message); if (e.code === 'stale_conflict' || e.code === 'conflict_not_pending') await load(true); }
+    catch (e) { setErr(friendlyError(e)); if (e.code === 'stale_conflict' || e.code === 'conflict_not_pending') await load(true); }
     finally { setBusy(false); setAsk(null); }
   }
   const resolve = extra => post('/api/conflicts/' + encodeURIComponent(id) + '/resolve', { expected_field_version: d.current_field_version, ...extra });
@@ -119,6 +124,7 @@ export function ConflictDialog({ id, role, onClose, onChanged, notify, Modal, Ba
   })();
 
   return <Modal title="Review conflict" close={onClose}>
+    {!online && <div className="disclaimer" role="status" style={{ marginBottom: 12 }}>You are offline. Decisions need a connection so the server can check them against the current record; nothing can be changed from here until you are back online.</div>}
     {err && <div className="disclaimer" role="alert" style={{ marginBottom: 12, fontSize: 13, fontWeight: 600, borderLeft: '3px solid #e8a33d', color: '#f3dcae' }}>{err}</div>}
     {body}
     {ask && <div className="modal-note" role="alertdialog" style={{ marginTop: 10 }}>

@@ -3,5 +3,10 @@
   "private": true,
   "type": "module",
   "description": "End-to-end checks that drive the real app in a real browser against the real backend. Synthetic data only.",
-  "devDependencies": { "playwright-core": "^1.49.0" }
+  "devDependencies": {
+    "playwright-core": "^1.49.0"
+  },
+  "dependencies": {
+    "axe-core": "^4.14.0"
+  }
 }

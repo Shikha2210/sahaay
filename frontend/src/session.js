@@ -7,7 +7,7 @@
 //  * unsynced operations are never deleted without an explicit `discard: true` from a confirmed dialog;
 //  * an expired token never wipes local data.
 import { db } from './db';
-import { getToken, setToken, isTokenExpired } from './api';
+import { api, getToken, setToken, isTokenExpired } from './api';
 
 const PROFILE_KEY = 'sahaay-session';
 const OWNER_KEY = 'device_owner';
@@ -41,8 +41,8 @@ export async function countUnsynced(ownerId) {
 }
 
 export async function wipeLocalData() {
-  await db.transaction('rw', db.patients, db.operations, db.conflicts, db.audit, db.sync_state, async () => {
-    await Promise.all([db.patients.clear(), db.operations.clear(), db.conflicts.clear(), db.audit.clear(), db.sync_state.clear()]);
+  await db.transaction('rw', db.patients, db.operations, db.conflicts, db.audit, db.sync_state, db.cache, async () => {
+    await Promise.all([db.patients.clear(), db.operations.clear(), db.conflicts.clear(), db.audit.clear(), db.sync_state.clear(), db.cache.clear()]);
   });
 }
 
@@ -72,6 +72,7 @@ export async function beginLogout() { return { pending: await countUnsynced() };
 export async function completeLogout({ discard = false } = {}) {
   const pending = await countUnsynced();
   if (pending > 0 && !discard) { const e = new Error('UNSYNCED_OPERATIONS'); e.pending = pending; throw e; }
+  try { if (getToken() && navigator.onLine !== false) await api('/api/auth/logout', { method: 'POST', timeoutMs: 3000 }); } catch { /* the audit record is best effort; signing out always works */ }
   await wipeLocalData();
   endSession();
 }

@@ -136,7 +136,7 @@ await section('patient two: explain my conflict', async page => {
 await section('worker one: explain my conflict', async page => {
   await login(page, 'worker', 'worker1'); await goNav(page, 'Sync conflicts'); await sleep(1500);
   const btns = page.getByRole('button', { name: /Explain this conflict \(AI\)/ });
-  R.check('each conflict card offers an explanation (their own two conflicts)', (await btns.count()) === 2);
+  R.check('each conflict card offers an explanation (their own two conflicts)', !!(await waitFor(async () => (await btns.count()) === 2, 10000, 300)));
   const n = groq().length; await btns.first().click();
   const ok = await waitFor(async () => /TEST-DOUBLE EXPLANATION/.test(await page.locator('main').innerText()), 10000, 200);
   const sent = JSON.stringify(groq().at(-1).messages);

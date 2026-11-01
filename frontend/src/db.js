@@ -33,6 +33,16 @@ db.version(3).stores({
   audit:'++id,patient_id,event_type,created_at',
   sync_state:'key'
 });
+// Version 4: a small per-user cache of the last successful server reads (so read-only screens still show the last-known information
+// offline). Tagged with owner_id and wiped on logout / user switch together with all other local data.
+db.version(4).stores({
+  patients:'patient_id,name,identity_status',
+  operations:'operation_id,patient_id,status,created_at,device_id,owner_id',
+  conflicts:'conflict_id,patient_id,category,status',
+  audit:'++id,patient_id,event_type,created_at',
+  sync_state:'key',
+  cache:'key,owner_id'
+});
 export async function seed(){
   // Seed each table independently: existing patients must not prevent missing demo conflicts from being seeded.
   if(await db.patients.count()===0) await db.patients.bulkAdd([

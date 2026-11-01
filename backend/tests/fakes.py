@@ -14,9 +14,16 @@ class FakeUsers:
         return None
 
 
+class _AuditSink:
+    """Collects audit rows written by login (the real database has an `audit` collection)."""
+    def __init__(self): self.docs = []
+    def insert_one(self, doc, **kw): self.docs.append(doc)
+
+
 class FakeDB:
     def __init__(self, *users):
         self.users = FakeUsers(*users)
+        self.audit = _AuditSink()
 
 
 def user_doc(role="worker", email=None, password_hash=None, active=True):
@@ -61,6 +68,9 @@ def _match(doc, query):
                 if op == "$in" and not (val is not _MISSING and val in arg): return False
                 if op == "$ne" and val == arg: return False
                 if op == "$exists" and (val is not _MISSING) != bool(arg): return False
+                if op == "$gte" and not (val is not _MISSING and val >= arg): return False
+                if op == "$lt" and not (val is not _MISSING and val < arg): return False
+                if op == "$nin" and val is not _MISSING and val in arg: return False
                 if op == "$type" and not (val is not _MISSING and isinstance(val, str)): return False
                 if op == "$elemMatch" and not (isinstance(val, list) and any(isinstance(i, dict) and _match(i, arg) for i in val)): return False
         elif val is _MISSING or val != cond:
@@ -70,7 +80,11 @@ def _match(doc, query):
 
 class _Cursor(list):
     def sort(self, key, direction=1):
-        super().sort(key=lambda d: (d.get(key) is None, d.get(key)), reverse=(direction == -1)); return self
+        keys = key if isinstance(key, list) else [(key, direction)]
+        for k, d in reversed(keys):      # stable multi-key sort, like MongoDB's compound sort
+            super().sort(key=lambda doc, k=k: (doc.get(k) is None, str(doc.get(k)) if not isinstance(doc.get(k), (int, float)) else doc.get(k)), reverse=(d == -1))
+        return self
+    def skip(self, n): return _Cursor(self[n:])
     def limit(self, n): return _Cursor(self[:n])
 
 
@@ -91,6 +105,7 @@ class MemCollection:
             raise DuplicateKeyError(f"duplicate {self.unique}")
         doc.setdefault("_id", ObjectId())
         self.docs.append(doc)
+        return SimpleNamespace(inserted_id=doc["_id"])
 
     def update_one(self, flt, update, **kw):
         d = self.find_one(flt)
@@ -129,13 +144,14 @@ class _UniqueTuple(MemCollection):
 
 class MemMongo:
     """Holds the collections the sync code touches and plays the role of both `db` and `client`."""
-    names = ("patients", "operations", "changes", "audit", "conflicts", "counters", "users", "evidence", "patient_confirmations")
+    names = ("patients", "operations", "changes", "audit", "conflicts", "counters", "users", "evidence", "patient_confirmations", "identity_attempts")
 
     def __init__(self):
         self.patients = MemCollection("patient_id")
         self.operations = MemCollection("operation_id")
         self.changes, self.audit, self.conflicts, self.users = (MemCollection() for _ in range(4))
         self.counters = MemCollection()
+        self.identity_attempts = MemCollection()
         self.evidence = _UniqueTuple(lambda d: (d.get('conflict_id'), d.get('evidence_reference')))
         self.patient_confirmations = _UniqueTuple(lambda d: (d.get('conflict_id'), d.get('user_id')))
         self.counters.docs.append({"_id": "global_change_seq", "value": 0})

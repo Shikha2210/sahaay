@@ -1,5 +1,5 @@
-import uuid, re, json, hashlib
-from datetime import datetime, timezone
+import uuid, re, json, hashlib, time
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Query, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +29,12 @@ def clean(doc):
     doc=dict(doc); doc.pop('_id',None); return doc
 def audit(patient_id, actor, event_type, description, metadata=None):
     db.audit.insert_one({'patient_id':patient_id,'actor_id':str(actor.get('_id','system')) if isinstance(actor,dict) else str(actor),'actor_role':actor.get('role','system') if isinstance(actor,dict) else 'system','event_type':event_type,'description':description,'metadata':metadata or {},'created_at':UTC()})
+SECURITY_EVENTS={'LOGIN_SUCCESS','LOGIN_FAILED','LOGIN_BLOCKED','LOGOUT','ACCOUNT_REGISTERED'}   # visible to supervisors only
+_blocked_logged={}   # key -> monotonic time of the last LOGIN_BLOCKED audit row (so an attacker cannot flood the audit log)
+def audit_security(event,actor,description,metadata):
+    """Best-effort audit of authentication events. A failure to write the audit row never changes the login result."""
+    try: audit(None,actor,event,description,metadata)
+    except PyMongoError: pass
 def next_seq(session):
     counter=db.counters.find_one_and_update({'_id':'global_change_seq'},{'$inc':{'value':1}},return_document=ReturnDocument.AFTER,session=session)
     return counter['value']
@@ -76,19 +82,35 @@ def register(body:RegisterIn):
     try: result=db.users.insert_one(doc)
     except DuplicateKeyError: raise HTTPException(409,'Email already registered')
     doc['_id']=result.inserted_id
+    audit_security('ACCOUNT_REGISTERED',doc,'Patient account registered',{})
     return {'access_token':create_token(doc),'token_type':'bearer','user':public_user(doc)}
 
 @app.post('/api/auth/login')
 def login(body:LoginIn,request:Request):
-    key=f"{request.client.host if request.client else 'unknown'}|{body.email.lower()}"
-    if login_limiter.blocked(key): raise HTTPException(429,'Too many failed sign-in attempts. Wait a few minutes and try again.',headers={'Retry-After':'300'})
+    ip=request.client.host if request.client else 'unknown'
+    key=f"{ip}|{body.email.lower()}"
+    who_hash=hashlib.sha256(body.email.lower().encode()).hexdigest()[:16]   # attempted account is recorded as a hash, not the address
+    anon={'_id':'anonymous','role':'anonymous'}
+    if login_limiter.blocked(key):
+        if time.monotonic()-_blocked_logged.get(key,-1e9)>300:
+            _blocked_logged[key]=time.monotonic(); audit_security('LOGIN_BLOCKED',anon,'Sign-in blocked after repeated failures',{'ip':ip,'account_hash':who_hash})
+        raise HTTPException(429,'Too many failed sign-in attempts. Wait a few minutes and try again.',headers={'Retry-After':'300'})
     user=db.users.find_one({'email':body.email.lower(),'active':True})
     # Same message and similar work whether the account exists or not (no account enumeration).
     valid=verify_password(body.password,user['password_hash']) if user else (verify_password(body.password,_DUMMY_HASH) and False)
     if not valid:
-        login_limiter.record_failure(key); raise HTTPException(401,'Incorrect email or password')
+        login_limiter.record_failure(key)
+        audit_security('LOGIN_FAILED',anon,'Failed sign-in attempt',{'ip':ip,'account_hash':who_hash,'reason':'wrong_password' if user else 'unknown_account'})
+        raise HTTPException(401,'Incorrect email or password')
     login_limiter.reset(key)
+    audit_security('LOGIN_SUCCESS',user,'Signed in',{'ip':ip})
     return {'access_token':create_token(user),'token_type':'bearer','user':public_user(user)}
+
+@app.post('/api/auth/logout')
+def logout(user=Depends(current_user)):
+    """Records the sign-out. Tokens are stateless and stay valid until they expire (short-lived); this endpoint is for accountability."""
+    audit_security('LOGOUT',user,'Signed out',{})
+    return {'ok':True}
 
 @app.get('/api/auth/me')
 def me(user=Depends(current_user)): return public_user(user)
@@ -544,13 +566,58 @@ def identity_attempt(patient_id:str,body:IdentityAttemptIn,user=Depends(require_
     db.identity_attempts.insert_one(safe); audit(patient_id,user,'IDENTITY_ATTEMPT_RECORDED','Identity attempt recorded',{'method':safe['method']})
     return {'status':safe['status'],'note':safe['note']}
 
+_EVENT_RE=re.compile(r'^[A-Z][A-Z_]{2,39}$')
+def _day(value,name):
+    try: return datetime.strptime(value,'%Y-%m-%d').replace(tzinfo=timezone.utc)
+    except ValueError: fail(422,'invalid_date',f"{name} must be a date like 2026-11-02")
+
 @app.get('/api/audit')
-def audit_list(limit:int=Query(default=100,ge=1,le=500),user=Depends(require_roles('supervisor','clinician'))):
-    return [clean(x) for x in db.audit.find().sort('created_at',-1).limit(limit)]
+def audit_list(page:int=Query(default=1,ge=1,le=100000),page_size:int=Query(default=50,ge=1,le=100),event_type:str|None=Query(default=None,max_length=300),actor_role:str|None=Query(default=None,max_length=20),
+               patient_id:str|None=Query(default=None,max_length=40),since:str|None=Query(default=None,max_length=10),until:str|None=Query(default=None,max_length=10),user=Depends(require_roles('supervisor','clinician'))):
+    """Filterable, paginated audit history, newest first. Supervisors see everything; clinicians do not see security events (sign-ins, IP addresses)."""
+    q={}
+    types=[t for t in (event_type or '').split(',') if t]
+    for t in types:
+        if not _EVENT_RE.match(t): fail(422,'invalid_event_type','event_type must be one or more upper-case event names, comma separated')
+    if user['role']!='supervisor':
+        types=[t for t in types if t not in SECURITY_EVENTS] if types else types
+        q['event_type']={'$in':types} if types else {'$nin':sorted(SECURITY_EVENTS)}
+        if event_type and not types: q['event_type']={'$in':['__none__']}
+    elif types: q['event_type']={'$in':types}
+    if actor_role:
+        if not re.match(r'^[a-z]{3,20}$',actor_role): fail(422,'invalid_actor_role','actor_role must be a role name')
+        q['actor_role']=actor_role
+    if patient_id: q['patient_id']=patient_id
+    when={}
+    if since: when['$gte']=_day(since,'since').isoformat()
+    if until: when['$lt']=(_day(until,'until')+timedelta(days=1)).isoformat()
+    if when: q['created_at']=when
+    total=db.audit.count_documents(q)
+    rows=list(db.audit.find(q).sort([('created_at',-1),('_id',-1)]).skip((page-1)*page_size).limit(page_size))
+    ids=[]
+    for r in rows:
+        try: ids.append(ObjectId(r['actor_id']))
+        except Exception: pass
+    names={str(u['_id']):u.get('name') for u in db.users.find({'_id':{'$in':ids}})} if ids else {}
+    items=[{**clean(r),'actor_name':names.get(r.get('actor_id'))} for r in rows]
+    return {'items':items,'total':total,'page':page,'page_size':page_size,'has_more':page*page_size<total}
+
+@app.get('/api/sync/summary')
+def sync_summary(user=Depends(require_roles('supervisor','clinician'))):
+    """Server-side view of synchronisation for monitoring. Rejected operations are not stored on the server (they stay on the device)."""
+    ops=list(db.operations.find({}).sort('created_at',-1).limit(5000))
+    by_status={}; devices={}
+    for o in ops:
+        by_status[o.get('status','?')]=by_status.get(o.get('status','?'),0)+1
+        d=devices.setdefault(o.get('device_id','?'),{'device_id':o.get('device_id','?'),'operations':0,'last_seen':'','people':set()})
+        d['operations']+=1; d['last_seen']=max(d['last_seen'],o.get('created_at',''));
+        if o.get('actor_id'): d['people'].add(o['actor_id'])
+    dev=sorted(({**d,'people':len(d['people'])} for d in devices.values()),key=lambda d:d['last_seen'],reverse=True)[:50]
+    return {'operations_total':db.operations.count_documents({}),'sampled':len(ops),'by_status':by_status,'devices':dev,'changes_total':db.changes.count_documents({}),'pending_conflicts':db.conflicts.count_documents({'status':'pending'}),'patients':db.patients.count_documents({})}
 
 @app.get('/api/dashboard/summary')
 def dashboard(user=Depends(require_roles('worker','supervisor','clinician'))):
-    return {'patients':db.patients.count_documents({}),'pending_conflicts':db.conflicts.count_documents({'status':'pending'}),'pending_operations':db.operations.count_documents({'status':{'$in':['pending','retryable_error']}}),'identity_pending':db.identity_attempts.count_documents({'status':'PENDING_AUTHENTIC_VERIFICATION'}),'recent_audit':db.audit.count_documents({})}
+    return {'patients':db.patients.count_documents({}),'pending_conflicts':db.conflicts.count_documents({'status':'pending'}),'operations_total':db.operations.count_documents({}),'identity_pending':db.identity_attempts.count_documents({'status':'PENDING_AUTHENTIC_VERIFICATION'}),'recent_audit':db.audit.count_documents({})}
 
 # =====================================================================================================================
 # AI ASSISTANCE (Milestone 5). Logic and safety rules: app/ai.py. The AI only produces TEXT: nothing here can approve, reject or resolve
