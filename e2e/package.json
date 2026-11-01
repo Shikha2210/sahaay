@@ -1,0 +1,7 @@
+{
+  "name": "sahaay-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end checks that drive the real app in a real browser against the real backend. Synthetic data only.",
+  "devDependencies": { "playwright-core": "^1.49.0" }
+}

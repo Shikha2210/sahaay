@@ -146,3 +146,10 @@ Positive: passwords bcrypt-hashed; JWT validated and user re-loaded from DB on e
 
 # Verification on real Atlas (2026-11-01)
 S1, S3, S4 and the idempotency/ordering guarantees now also pass against a real Atlas replica set (see TEST_REPORT_M2.md). Server-side S2 ordering is covered by stand-in tests; the real-Atlas suite covers create/update/conflict flows only. New operational note: **Atlas Network Access must contain every public IP the machine uses** (intermittent `TLSV1_ALERT_INTERNAL_ERROR` otherwise).
+
+---
+# Confirmed on the live system — Milestone 2C (2026-11-01)
+Full evidence and reproduction steps in `MILESTONE_2C_REPORT.md`.
+* **New / re-prioritised:** C5 (stale conflict overwrote newer dosage, **High, clinical**), C6 (HTTP 500 on evidence resubmission, confirmed), C3/C4 (supervisor resolved a document conflict with an arbitrary value, confirmed), C1/C2/F1/X8/S5/S11/X5 confirmed in the running app; S9 refined: manual "Sync now" and the auto-sync timer can upload the same operation concurrently (safe because of server idempotency).
+* **Fixed bugs verified live on Atlas:** S1, S3, S4, ordering (S2), idempotent replay, lost-acknowledgement recovery, X1/X2/X3/X4, bootstrap and index creation.
+* **Operational:** synthetic accounts/records (`ZZ-SYNTHETIC ...`) now exist in the real `sahaay` database; there is no delete/deactivate endpoint.
