@@ -1,0 +1,14 @@
+# Frontend deployment (Netlify). Set VITE_API_URL (https origin of the backend) and VITE_SEED_DEMO_DATA=false in the site's environment variables.
+[build]
+  base = "frontend"
+  command = "npm ci && npm run build:deploy"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+  VITE_SEED_DEMO_DATA = "false"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

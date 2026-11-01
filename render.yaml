@@ -1,0 +1,23 @@
+# Backend deployment (Render). Secrets marked sync:false are entered in the Render dashboard and never stored in git.
+services:
+  - type: web
+    name: sahaay-api
+    runtime: python
+    plan: free                # free tier sleeps after ~15 min idle; change to "starter" only after approving the cost
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    numInstances: 1           # rate limiters are in memory: keep a single instance
+    envVars:
+      - { key: PYTHON_VERSION, value: 3.11.9 }
+      - { key: ENVIRONMENT, value: production }
+      - { key: TRUST_PROXY_HEADERS, value: "true" }       # Render's proxy sets X-Forwarded-For
+      - { key: SEED_DEMO_DATA, value: "false" }
+      - { key: MONGODB_DATABASE, value: sahaay_demo }
+      - { key: JWT_EXPIRE_MINUTES, value: "60" }
+      - { key: MONGODB_URI, sync: false }
+      - { key: JWT_SECRET, sync: false }
+      - { key: CORS_ORIGINS, sync: false }
+      - { key: BOOTSTRAP_SUPERVISOR_EMAIL, sync: false }
+      - { key: BOOTSTRAP_SUPERVISOR_PASSWORD, sync: false }
