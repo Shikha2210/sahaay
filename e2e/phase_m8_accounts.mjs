@@ -7,7 +7,7 @@ const msg = async p => (await p.locator('.login-card [role=alert]').first().inne
 async function signup(page, n, e, pw) { await page.getByPlaceholder('Enter your name').fill(n); await page.getByPlaceholder('you@example.com').fill(e); await page.getByPlaceholder('Enter password').fill(pw); await page.getByRole('button', { name: 'Create patient account' }).click(); await sleep(1500); }
 let p = await fresh(); await signup(p, 'ZZ Synthetic Patient', `zz.p.${rnd}@gmail.com`, 'abcd1234');
 R.check('short password: the message names the password and the 10-character minimum', /Password is too short.*10/.test(await msg(p)), await msg(p));
-await p.locator('input[placeholder="you@example.com"]').fill('not-an-email'); await p.getByPlaceholder('Enter password').fill('Strong-Pass-2026!'); await p.getByRole('button', { name: 'Create patient account' }).click(); await sleep(1200);
+await p.getByPlaceholder('you@example.com').fill('not-an-email'); await p.getByPlaceholder('Enter password').fill('Strong-Pass-2026!'); await p.getByRole('button', { name: 'Create patient account' }).click(); await sleep(1200);
 R.check('bad email: the message asks for a valid email address', /valid email/i.test(await msg(p)), await msg(p));
 R.check('the 10-character hint is visible before submitting', /at least 10 characters/.test(await p.locator('.login-card').innerText()));
 const pe = `zz.p2.${rnd}@gmail.com`; p = await fresh(); await signup(p, 'ZZ Synthetic Patient', pe, 'Strong-Pass-2026!');
@@ -15,30 +15,33 @@ R.check('valid patient self-registration signs the patient in', (await p.locator
 p = await fresh(); await signup(p, 'ZZ Synthetic Patient', pe, 'Strong-Pass-2026!');
 R.check('registering the same email again says it is already registered', /already registered/i.test(await msg(p)), await msg(p));
 
+const sp = await fresh();
+R.check('the sign-in screen offers Patient, Healthcare Worker and Supervisor only (no clinician)', JSON.stringify(await sp.locator('.role-option').allInnerTexts().then(a => a.map(x => x.trim()))) === JSON.stringify(['Patient', 'Healthcare Worker', 'Professional Supervisor']));
+R.check('the sign-up form has no Patient ID / phone claim fields', (await sp.getByPlaceholder('e.g. SH-1234').count()) === 0);
+const own = await fresh(); await signup(own, 'ZZ Synthetic Auto Patient', `zz.auto.${rnd}@gmail.com`, 'Strong-Pass-2026!'); await sleep(2200);
+const ot = (await own.locator('main .content').innerText()).replace(/\s+/g, ' ');
+R.check('a new patient is given an ID automatically and sees their own record (no supervisor approval)', /Your record SH-[0-9A-F]{8}/.test(ot) && /Linked to your account/.test(ot) && !/not linked/i.test(ot), ot.slice(0, 120));
+
 const { context, page } = await newSession(b);
 R.check('supervisor signs in', !!(await loginUi(page, 'supervisor', env.BOOTSTRAP_SUPERVISOR_EMAIL, env.BOOTSTRAP_SUPERVISOR_PASSWORD))); await sleep(1200);
-R.check('"Staff accounts" is in the supervisor menu', (await page.locator('.sidebar nav .nav-item', { hasText: 'Staff accounts' }).count()) === 1);
 await goNav(page, 'Staff accounts'); await sleep(600);
-const we = `zz.worker.${rnd}@gmail.com`;
-await page.getByLabel('Full name').fill('ZZ Synthetic Worker'); await page.getByLabel('Email address').fill(we);
-R.check('the create button stays disabled until a 10+ character password exists', await page.getByRole('button', { name: 'Create account' }).isDisabled());
+R.check('staff role choices are Health worker and Supervisor (no clinician)', JSON.stringify(await page.getByLabel('Role').locator('option').allInnerTexts()) === JSON.stringify(['Health worker', 'Supervisor']));
+await page.getByLabel('Full name').fill('ZZ Synthetic Worker');
+R.check('email is optional: the form can be completed with name + password only', !(await page.getByLabel('Email address (optional)').evaluate(e => e.required)));
 await page.getByRole('button', { name: 'Generate a strong password' }).click();
 const pw = await page.getByLabel('Password', { exact: true }).inputValue();
-R.check('"Generate" fills a 16-character mixed password', pw.length === 16 && /[a-z]/.test(pw) && /[A-Z]/.test(pw) && /\d/.test(pw) && /[^A-Za-z0-9]/.test(pw));
 await page.getByRole('button', { name: 'Create account' }).click(); await sleep(1500);
 const t = await page.locator('main .content').innerText();
-R.check('success is shown once with the email and the password', t.includes(we) && t.includes(pw) && /shown once/i.test(t));
-await page.getByLabel('Full name').fill('ZZ Synthetic Worker'); await page.getByLabel('Email address').fill(we); await page.getByLabel('Password', { exact: true }).fill(pw); await page.getByRole('button', { name: 'Create account' }).click(); await sleep(1200);
-R.check('creating the same staff email again is refused with a clear message', /already has an account/.test(await page.locator('[role=alert]').first().innerText().catch(() => '')));
-await page.getByLabel('Role').selectOption('clinician'); await page.getByLabel('Full name').fill('ZZ Synthetic Clinician'); const ce = `zz.clin.${rnd}@gmail.com`; await page.getByLabel('Email address').fill(ce); await page.getByLabel('Password', { exact: true }).fill('Another-Strong-1!'); await page.getByRole('button', { name: 'Create account' }).click(); await sleep(1200);
-R.check('a clinician account can be created the same way', /clinician/.test(await page.locator('main .content').innerText()));
+const lid = (t.match(/Login ID:\s*(HW-[A-Z0-9]{6})/) || [])[1];
+R.check('a random login ID like HW-XXXXXX is generated and shown once with the password', !!lid && t.includes(pw), lid);
 await goNav(page, 'Audit history'); await sleep(1500);
-R.check('the creations appear in the audit history', /Provisioned worker account|Provisioned clinician account/i.test(await page.locator('main .content').innerText()));
+R.check('the creation is in the audit history', /Provisioned worker account/i.test(await page.locator('main .content').innerText()));
 await context.close();
 
 const w = await newSession(b);
-R.check('the NEW health worker signs in with the generated password and sees the worker menu', !!(await loginUi(w.page, 'worker', we, pw)) && /Patient directory/.test(await w.page.locator('.sidebar').innerText()));
+R.check('the health worker signs in with ONLY the generated ID (no email)', !!(await loginUi(w.page, 'worker', lid, pw)) && /Patient directory/.test(await w.page.locator('.sidebar').innerText()));
 await w.context.close();
-const c = await newSession(b);
-R.check('the NEW clinician signs in', !!(await loginUi(c.page, 'clinician', ce, 'Another-Strong-1!')));
+const w2 = await newSession(b); await w2.page.goto(BASE); await w2.page.locator('.role-option', { hasText: 'Healthcare Worker' }).click();
+await w2.page.getByPlaceholder('Enter your name').fill('x'); await w2.page.getByPlaceholder('you@example.com').fill(lid.toLowerCase()); await w2.page.getByPlaceholder('Enter password').fill(pw); await w2.page.locator('button.sign-in').click();
+R.check('the ID works in lower case too', !!(await waitFor(async () => (await w2.page.locator('.sidebar').count()) > 0, 12000)));
 R.finish(); await b.close();

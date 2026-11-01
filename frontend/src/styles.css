@@ -5,3 +5,5 @@
 
 /* Keyboard focus must always be visible (M7): several controls above remove the default outline. */
 *:focus-visible{outline:2px solid #d6b8f0 !important;outline-offset:2px}
+
+.claim-box{border:1px solid #ffffff1c;border-radius:10px;padding:10px 12px;margin:0 0 12px;display:grid;gap:8px}.claim-box legend{font-size:10px;padding:0 6px;color:#d7cbd9}

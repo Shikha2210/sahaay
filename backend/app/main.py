@@ -9,8 +9,8 @@ from bson import ObjectId
 from app.config import settings
 from app.db import client, db, init_db
 from app import ai
-from app.schemas import RegisterIn, LoginIn, PatientIn, BatchIn, ResolveIn, IdentityAttemptIn, ChatIn, SummaryIn, ExplainIn, operation_problem, validate_change_values, EvidenceSubmitIn, EvidenceReviewIn, ConfirmIn, LinkAccountIn
-from app.security import hash_password, verify_password, create_token, current_user, require_roles, public_user, login_limiter, ip_login_limiter, register_limiter
+from app.schemas import RegisterIn, LoginIn, StaffIn, PatientIn, BatchIn, ResolveIn, IdentityAttemptIn, ChatIn, SummaryIn, ExplainIn, operation_problem, validate_change_values, EvidenceSubmitIn, EvidenceReviewIn, ConfirmIn, LinkAccountIn
+from app.security import hash_password, verify_password, create_token, current_user, require_roles, public_user, login_limiter, ip_login_limiter, register_limiter, claim_ip_limiter, claim_pid_limiter
 from app.config import validate_bootstrap_password, validate_bootstrap_email
 
 UTC=lambda: datetime.now(timezone.utc).isoformat()
@@ -87,6 +87,26 @@ def health():
     try: client.admin.command('ping'); return {'status':'ok','mongodb':'connected','database':settings.mongodb_database}
     except Exception: raise HTTPException(503,'MongoDB is unavailable')
 
+def _digits(v): return ''.join(c for c in (v or '') if c.isdigit())
+
+def _claim_target(body,ip):
+    """Patient sign-up that asks to connect to an EXISTING record. Both the Patient ID and the phone number recorded by the health worker must match.
+    Returns the record's patient_id, or raises one deliberately vague 400 (it never says which part was wrong or whether the ID exists).
+    Guessing is throttled per address and per record, and every attempt is audited."""
+    pid=(body.claim_patient_id or '').strip(); phone=_digits(body.claim_phone)
+    def refuse(reason):
+        claim_ip_limiter.record_failure(ip); claim_pid_limiter.record_failure(pid.upper())
+        audit_security('PATIENT_LINK_FAILED',{'_id':'anonymous','role':'anonymous'},'Failed attempt to connect a new account to an existing record',{'ip':ip,'patient_id':pid[:40],'reason':reason})
+        raise HTTPException(400,{'code':'record_not_matched','message':'We could not connect to a record with those details. Check the Patient ID and the phone number your health worker recorded, or leave them empty to start a new record.'})
+    if claim_ip_limiter.blocked(ip) or claim_pid_limiter.blocked(pid.upper()):
+        raise HTTPException(429,{'code':'too_many_attempts','message':'Too many attempts. Please wait an hour or ask your health worker to link your account.'},headers={'Retry-After':'3600'})
+    if not pid or len(phone)<7: refuse('incomplete')
+    rec=db.patients.find_one({'patient_id':pid})
+    rec_phone=_digits(rec.get('phone')) if rec else ''
+    if not rec or len(rec_phone)<7 or rec_phone[-10:]!=phone[-10:]: refuse('no_match')
+    if db.users.find_one({'linked_patient_id':rec['patient_id']}): refuse('already_linked')
+    return rec['patient_id']
+
 def _create_own_record(account):
     """Self-service sign-up: give the new patient a brand-new record of their own and link it at once.
     This grants access to NOTHING that already exists - the record is empty apart from the name they typed - so no supervisor check is
@@ -110,11 +130,20 @@ def register(body:RegisterIn,request:Request):
     if register_limiter.blocked(rip): raise HTTPException(429,'Too many accounts were created from this address. Try again later.',headers={'Retry-After':'3600'})
     register_limiter.record_failure(rip)
     doc={'name':body.name.strip(),'email':body.email.lower(),'password_hash':hash_password(body.password),'role':'patient','active':True,'created_at':UTC()}
+    claimed=None
+    if (body.claim_patient_id or body.claim_phone) and not settings.allow_record_claim:
+        raise HTTPException(400,{'code':'claim_disabled','message':'Connecting to an existing record is done by your health worker or supervisor. Leave the Patient ID and phone empty to get your own record.'})
+    if body.claim_patient_id or body.claim_phone:
+        claimed=_claim_target(body,rip)
+        now=UTC(); doc.update({'linked_patient_id':claimed,'linked_by':'self_claim','linked_at':now,'identity_check':{'verified':False,'method':'self_claim_id_and_phone','note':'Patient ID and phone number matched; nobody verified who the person is','checked_by':None,'checked_at':now}})
     try: result=db.users.insert_one(doc)
-    except DuplicateKeyError: raise HTTPException(409,'Email already registered')
+    except DuplicateKeyError:
+        if db.users.find_one({'email':doc['email']}): raise HTTPException(409,'Email already registered')
+        raise HTTPException(400,{'code':'record_not_matched','message':'We could not connect to a record with those details. Check the Patient ID and the phone number your health worker recorded, or leave them empty to start a new record.'})
     doc['_id']=result.inserted_id
     audit_security('ACCOUNT_REGISTERED',doc,'Patient account registered',{})
-    if settings.self_service_patient_records: _create_own_record(doc)
+    if claimed: audit(claimed,doc,'PATIENT_SELF_LINKED','Patient connected their new account to an existing record using the Patient ID and phone number (identity not verified)',{})
+    elif settings.self_service_patient_records: _create_own_record(doc)
     return {'access_token':create_token(doc),'token_type':'bearer','user':public_user(doc)}
 
 @app.post('/api/auth/login')
@@ -127,7 +156,8 @@ def login(body:LoginIn,request:Request):
         if time.monotonic()-_blocked_logged.get(key,-1e9)>300:
             _blocked_logged[key]=time.monotonic(); audit_security('LOGIN_BLOCKED',anon,'Sign-in blocked after repeated failures',{'ip':ip,'account_hash':who_hash})
         raise HTTPException(429,'Too many failed sign-in attempts. Wait a few minutes and try again.',headers={'Retry-After':'300'})
-    user=db.users.find_one({'email':body.email.lower(),'active':True})
+    ident=body.email.strip()
+    user=db.users.find_one({'email':ident.lower(),'active':True}) if '@' in ident else db.users.find_one({'login_id':ident.upper(),'active':True})
     # Same message and similar work whether the account exists or not (no account enumeration).
     valid=verify_password(body.password,user['password_hash']) if user else (verify_password(body.password,_DUMMY_HASH) and False)
     if not valid:
@@ -147,14 +177,26 @@ def logout(user=Depends(current_user)):
 @app.get('/api/auth/me')
 def me(user=Depends(current_user)): return public_user(user)
 
+LOGIN_ID_ALPHABET='ABCDEFGHJKMNPQRSTUVWXYZ23456789'   # no 0/O/1/I/L: easy to read out and type
+LOGIN_ID_PREFIX={'worker':'HW','clinician':'CL','supervisor':'SV'}
+def new_login_id(role):
+    import secrets
+    return LOGIN_ID_PREFIX.get(role,'ST')+'-'+''.join(secrets.choice(LOGIN_ID_ALPHABET) for _ in range(6))
+
 @app.post('/api/admin/users',status_code=201)
-def provision_user(body:RegisterIn,user=Depends(require_roles('supervisor'))):
+def provision_user(body:StaffIn,user=Depends(require_roles('supervisor'))):
+    """Create a staff login. The person signs in with the generated login ID (or the email, if one was given) and the password chosen here."""
     if body.role not in {'worker','clinician','supervisor'}: raise HTTPException(400,'Role must be worker, clinician or supervisor')
-    doc={'name':body.name.strip(),'email':body.email.lower(),'password_hash':hash_password(body.password),'role':body.role,'active':True,'created_at':UTC()}
-    try: db.users.insert_one(doc)
-    except DuplicateKeyError: raise HTTPException(409,'Email already registered')
-    audit(None,user,'USER_PROVISIONED',f"Provisioned {body.role} account",{'email':doc['email']})
-    return {'created':True,'email':doc['email'],'role':doc['role']}
+    for _ in range(8):
+        lid=new_login_id(body.role)
+        email=body.email.lower() if body.email else lid.lower()+'@id.sahaay.invalid'      # internal placeholder when no email was given (never shown as an address)
+        doc={'name':body.name.strip(),'email':email,'login_id':lid,'password_hash':hash_password(body.password),'role':body.role,'active':True,'created_at':UTC()}
+        try: db.users.insert_one(doc); break
+        except DuplicateKeyError:
+            if body.email and db.users.find_one({'email':email}): raise HTTPException(409,'Email already registered')
+    else: raise HTTPException(503,'Could not create a unique login ID. Please try again.')
+    audit(None,user,'USER_PROVISIONED',f"Provisioned {body.role} account",{'login_id':lid})
+    return {'created':True,'email':body.email.lower() if body.email else None,'login_id':lid,'role':doc['role']}
 
 @app.get('/api/patients')
 def list_patients(q:str|None=None,user=Depends(require_roles('patient','worker','supervisor','clinician'))):

@@ -33,6 +33,7 @@ Front end and API should be on different **https** origins (for example `https:/
 | `CORS_ORIGINS` | exactly your frontend origin, e.g. `https://app.example.org` (https only; no `*`, no localhost) |
 | `BOOTSTRAP_SUPERVISOR_EMAIL` / `BOOTSTRAP_SUPERVISOR_PASSWORD` | a real address you control and a strong password; used **only** if no supervisor exists yet. Remove the password variable after first start. |
 | `SEED_DEMO_DATA` | `false` (production refuses `true`) |
+| `ALLOW_RECORD_CLAIM` | leave unset (`false`). `true` re-enables patients connecting themselves to an existing record with Patient ID + phone (weaker: anyone knowing both could take over that record; guesses are throttled and audited). |
 | `SELF_SERVICE_PATIENT_RECORDS` | `true` (default): a patient who signs up immediately gets their **own new** record, no supervisor approval. It never gives access to a record staff already created (that still needs the supervisor's identity check). `false` restores supervisor-only linking; the M3/M4/M5 browser suites need `false` because their setup links accounts to pre-made records. |
 | `TRUST_PROXY_HEADERS` | `true` **only** if the backend is behind a proxy you control that sets `X-Forwarded-For` (needed for correct per-address rate limits and audit IPs). Otherwise leave `false`. |
 | `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_API_URL` | optional; URL must be https |

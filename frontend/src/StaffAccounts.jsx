@@ -8,7 +8,7 @@ import { friendlyError } from './offlineCache';
 import useOnline from './useOnline';
 import { NeedsConnection } from './Notices';
 
-const ROLES = [['worker', 'Health worker'], ['clinician', 'Clinician'], ['supervisor', 'Supervisor']];
+const ROLES = [['worker', 'Health worker'], ['supervisor', 'Supervisor']];
 
 function strongPassword() {
   const sets = ['abcdefghijkmnopqrstuvwxyz', 'ABCDEFGHJKLMNPQRSTUVWXYZ', '23456789', '!@#$%*+?'];
@@ -28,18 +28,18 @@ export default function StaffAccounts({ notify, ui }) {
   async function submit(e) {
     e.preventDefault(); setErr(''); setDone(null); setBusy(true);
     try {
-      const r = await api('/api/admin/users', { method: 'POST', body: JSON.stringify({ name: f.name.trim(), email: f.email.trim(), password: f.password, role: f.role }) });
-      setDone({ email: r.email, role: r.role, password: f.password }); notify('Staff account created.'); setF(blank);
+      const r = await api('/api/admin/users', { method: 'POST', body: JSON.stringify({ name: f.name.trim(), ...(f.email.trim() ? { email: f.email.trim() } : {}), password: f.password, role: f.role }) });
+      setDone({ loginId: r.login_id, email: r.email, role: r.role, password: f.password }); notify('Staff account created.'); setF(blank);
     } catch (er) { setErr(er.status === 409 ? 'That email address already has an account.' : friendlyError(er)); } finally { setBusy(false); }
   }
   return <div className="content">
-    <Head eyebrow="ACCESS CONTROL" title="Staff accounts" sub="Create a login for a health worker, clinician or supervisor. Staff cannot sign themselves up; each creation is recorded in the audit history." />
-    <div className="info-card"><Info /><p>Give the person their email and the password below in person or by a private channel, and ask them to keep it safe. The password is shown <b>once</b> and cannot be looked up later.</p></div>
+    <Head eyebrow="ACCESS CONTROL" title="Staff accounts" sub="Create a login for a health worker or supervisor. A random login ID (like HW-7K3Q9D) is generated for them; an email is optional. Staff cannot sign themselves up; each creation is recorded in the audit history." />
+    <div className="info-card"><Info /><p>Give the person their login ID and the password below in person or by a private channel, and ask them to keep it safe. The password is shown <b>once</b> and cannot be looked up later.</p></div>
     <Panel title="New staff account" sub="Passwords need at least 10 characters">
       <form className="modal-form" onSubmit={submit} style={{ maxWidth: 520 }}>
         {err && <div className="disclaimer" role="alert">{err}</div>}
         <label>Full name<input required minLength={2} maxLength={100} value={f.name} onChange={e => set('name', e.target.value)} autoComplete="off" /></label>
-        <label>Email address<input required type="email" value={f.email} onChange={e => set('email', e.target.value)} autoComplete="off" /></label>
+        <label>Email address (optional)<input type="email" value={f.email} onChange={e => set('email', e.target.value)} autoComplete="off" /></label>
         <label>Role<select value={f.role} onChange={e => set('role', e.target.value)}>{ROLES.map(([v, t]) => <option key={v} value={v}>{t}</option>)}</select></label>
         <label>Password<input required minLength={10} maxLength={128} value={f.password} onChange={e => set('password', e.target.value)} autoComplete="new-password" /></label>
         <div><button type="button" className="outline-btn" onClick={() => set('password', strongPassword())}>Generate a strong password</button></div>
@@ -47,6 +47,6 @@ export default function StaffAccounts({ notify, ui }) {
         <button className="gradient-btn" disabled={busy || !online || f.password.length < 10}>{busy ? 'Creating…' : 'Create account'}</button>
       </form>
     </Panel>
-    {done && <div className="info-card" role="status"><Info /><p>Created <b>{done.role === 'worker' ? 'health worker' : done.role}</b> account for <b>{done.email}</b>.<br />Password (shown once): <code>{done.password}</code></p></div>}
+    {done && <div className="info-card" role="status"><Info /><p>Created <b>{done.role === 'worker' ? 'health worker' : done.role}</b> account.<br />Login ID: <code>{done.loginId}</code>{done.email ? <> (or email <b>{done.email}</b>)</> : null}<br />Password (shown once): <code>{done.password}</code></p></div>}
   </div>;
 }

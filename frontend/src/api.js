@@ -79,6 +79,6 @@ export async function api(path, rawOptions = {}) {
   }
   return data;
 }
-export async function registerApi(name, email, password) { const result = await api('/api/auth/register', { method: 'POST', body: JSON.stringify({ name, email, password, role: 'patient' }) }); return result; }
+export async function registerApi(name, email, password, claim = {}) { const body = { name, email, password, role: 'patient' }; if (claim.patientId?.trim()) body.claim_patient_id = claim.patientId.trim(); if (claim.phone?.trim()) body.claim_phone = claim.phone.trim(); return api('/api/auth/register', { method: 'POST', body: JSON.stringify(body) }); }
 export async function loginApi(email, password) { return api('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }); }
 export async function meApi() { return api('/api/auth/me'); }

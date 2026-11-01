@@ -18,6 +18,7 @@ def init_db():
     db.audit.create_index([('event_type', ASCENDING), ('created_at', DESCENDING)])
     db.audit.create_index([('patient_id', ASCENDING), ('created_at', DESCENDING)])
     db.users.create_index([('role', ASCENDING)])
+    db.users.create_index([('login_id', ASCENDING)], unique=True, name='uniq_login_id', partialFilterExpression={'login_id': {'$type': 'string'}})
     db.chat_messages.create_index([('user_id', ASCENDING), ('created_at', ASCENDING)])
     db.identity_attempts.create_index([('patient_id', ASCENDING), ('created_at', DESCENDING)])
     db.evidence.create_index([('evidence_reference', ASCENDING), ('conflict_id', ASCENDING)], unique=True)

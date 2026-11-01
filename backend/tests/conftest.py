@@ -44,5 +44,5 @@ def app_jsx_source():
 def _reset_rate_limiters():
     """Failed-login / registration counters are per process; every test starts with clean ones."""
     from app import security
-    for lim in (security.login_limiter, security.ip_login_limiter, security.register_limiter): lim._fails.clear()
+    for lim in (security.login_limiter, security.ip_login_limiter, security.register_limiter, security.claim_ip_limiter, security.claim_pid_limiter): lim._fails.clear()
     yield

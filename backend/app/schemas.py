@@ -7,10 +7,19 @@ class RegisterIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=10, max_length=128)
     role: str = 'patient'
+    # Optional, patient sign-up only: connect to the record a health worker already created (needs BOTH to match).
+    claim_patient_id: str | None = Field(default=None, max_length=40)
+    claim_phone: str | None = Field(default=None, max_length=40)
 
 class LoginIn(BaseModel):
-    email: EmailStr
-    password: str
+    email: str = Field(min_length=3, max_length=254)     # an email address, or a staff login ID such as HW-7K3Q9D
+    password: str = Field(max_length=128)
+
+class StaffIn(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    password: str = Field(min_length=10, max_length=128)
+    role: str = 'worker'
+    email: EmailStr | None = None            # optional: staff can sign in with the login ID that is generated for them
 
 class PatientIn(BaseModel):
     patient_id: str = Field(min_length=3, max_length=40)

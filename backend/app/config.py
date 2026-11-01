@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     # true: a patient who signs up immediately gets their OWN new health record (no supervisor approval). They never get access to anyone else's.
     # false: the earlier mode where a supervisor must link the account to an existing record after an identity check.
     self_service_patient_records: bool = Field(default=True, alias='SELF_SERVICE_PATIENT_RECORDS')
+    # false (default): sign-up never connects to an existing record (only a supervisor can do that). true: the older Patient ID + phone self-claim.
+    allow_record_claim: bool = Field(default=False, alias='ALLOW_RECORD_CLAIM')
     # 'production' turns on the strict checks below (no API docs, HSTS, https-only origins, no demo data, no example accounts).
     environment: str = Field(default='development', alias='ENVIRONMENT')
     # Pull the real client address from X-Forwarded-For only when this is true (and only behind a proxy you control).

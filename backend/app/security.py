@@ -30,7 +30,7 @@ def create_token(user: dict) -> str:
 def public_user(user: dict) -> dict:
     """The only user fields ever sent to the browser (never the password hash)."""
     return {'id': str(user['_id']), 'name': user['name'], 'email': user['email'], 'role': user['role'],
-            'linked_patient_id': user.get('linked_patient_id')}
+            'linked_patient_id': user.get('linked_patient_id'), 'login_id': user.get('login_id')}
 
 
 def _unauthorized(code: str, message: str):
@@ -89,3 +89,5 @@ class LoginRateLimiter:
 login_limiter = LoginRateLimiter()                                         # per address + account
 ip_login_limiter = LoginRateLimiter(max_failures=30, window_seconds=300)   # per address, across accounts (password spraying)
 register_limiter = LoginRateLimiter(max_failures=10, window_seconds=3600)  # self-registrations per address per hour
+claim_ip_limiter = LoginRateLimiter(max_failures=10, window_seconds=3600)  # wrong record-claim guesses per address per hour
+claim_pid_limiter = LoginRateLimiter(max_failures=5, window_seconds=3600)  # wrong record-claim guesses per patient record per hour (stops guessing a phone number)
