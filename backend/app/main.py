@@ -125,11 +125,11 @@ def _create_own_record(account):
 
 @app.post('/api/auth/register')
 def register(body:RegisterIn,request:Request):
-    if body.role!='patient': raise HTTPException(403,'Public registration can only create patient accounts')
+    if body.role not in ('patient','worker') or (body.role=='worker' and not settings.allow_worker_signup): raise HTTPException(403,'Public registration can only create patient accounts')
     rip=client_ip(request)
     if register_limiter.blocked(rip): raise HTTPException(429,'Too many accounts were created from this address. Try again later.',headers={'Retry-After':'3600'})
     register_limiter.record_failure(rip)
-    doc={'name':body.name.strip(),'email':body.email.lower(),'password_hash':hash_password(body.password),'role':'patient','active':True,'created_at':UTC()}
+    doc={'name':body.name.strip(),'email':body.email.lower(),'password_hash':hash_password(body.password),'role':body.role,'active':True,'created_at':UTC()}
     claimed=None
     if (body.claim_patient_id or body.claim_phone) and not settings.allow_record_claim:
         raise HTTPException(400,{'code':'claim_disabled','message':'Connecting to an existing record is done by your health worker or supervisor. Leave the Patient ID and phone empty to get your own record.'})
@@ -141,7 +141,8 @@ def register(body:RegisterIn,request:Request):
         if db.users.find_one({'email':doc['email']}): raise HTTPException(409,'Email already registered')
         raise HTTPException(400,{'code':'record_not_matched','message':'We could not connect to a record with those details. Check the Patient ID and the phone number your health worker recorded, or leave them empty to start a new record.'})
     doc['_id']=result.inserted_id
-    audit_security('ACCOUNT_REGISTERED',doc,'Patient account registered',{})
+    audit_security('ACCOUNT_REGISTERED',doc,'Patient account registered' if body.role=='patient' else 'Health worker account self-registered (open demo sign-up)',{})
+    if body.role=='worker': return {'access_token':create_token(doc),'token_type':'bearer','user':public_user(doc)}
     if claimed: audit(claimed,doc,'PATIENT_SELF_LINKED','Patient connected their new account to an existing record using the Patient ID and phone number (identity not verified)',{})
     elif settings.self_service_patient_records: _create_own_record(doc)
     return {'access_token':create_token(doc),'token_type':'bearer','user':public_user(doc)}

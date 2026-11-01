@@ -14,6 +14,7 @@ services:
       - { key: ENVIRONMENT, value: production }
       - { key: TRUST_PROXY_HEADERS, value: "true" }       # Render's proxy sets X-Forwarded-For
       - { key: SEED_DEMO_DATA, value: "false" }
+      - { key: ALLOW_WORKER_SIGNUP, value: "true" }   # DEMO ONLY: anyone can create a health worker account; refused unless MONGODB_DATABASE starts with sahaay_demo. Set to "false" before real use.
       - { key: SELF_SERVICE_PATIENT_RECORDS, value: "true" }   # new patients get their own record at sign-up (no supervisor approval)
       - { key: MONGODB_DATABASE, value: sahaay_demo }
       - { key: JWT_EXPIRE_MINUTES, value: "60" }

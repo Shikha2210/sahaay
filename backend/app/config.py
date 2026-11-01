@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     self_service_patient_records: bool = Field(default=True, alias='SELF_SERVICE_PATIENT_RECORDS')
     # false (default): sign-up never connects to an existing record (only a supervisor can do that). true: the older Patient ID + phone self-claim.
     allow_record_claim: bool = Field(default=False, alias='ALLOW_RECORD_CLAIM')
+    # DEMO ONLY. true: anyone can create a health-worker account (email + password) with no approval, and so can read and edit every patient record in the
+    # database. Refused unless MONGODB_DATABASE starts with 'sahaay_demo', so it can never be switched on for the real 'sahaay' database. Synthetic data only.
+    allow_worker_signup: bool = Field(default=False, alias='ALLOW_WORKER_SIGNUP')
+    # DEMO ONLY. true: anyone can create a health-worker account (email + password) with no approval, and so can read and edit every patient record in the
+    # database. Refused unless MONGODB_DATABASE starts with 'sahaay_demo', so it can never be switched on for the real 'sahaay' database. Synthetic data only.
+    allow_worker_signup: bool = Field(default=False, alias='ALLOW_WORKER_SIGNUP')
     # 'production' turns on the strict checks below (no API docs, HSTS, https-only origins, no demo data, no example accounts).
     environment: str = Field(default='development', alias='ENVIRONMENT')
     # Pull the real client address from X-Forwarded-For only when this is true (and only behind a proxy you control).
@@ -114,6 +120,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode='after')
     def _production_rules(self):
+        if self.allow_worker_signup and not self.mongodb_database.startswith('sahaay_demo'):
+            raise ValueError('ALLOW_WORKER_SIGNUP is demo-only: MONGODB_DATABASE must start with sahaay_demo (synthetic data only)')
+        if self.allow_worker_signup and not self.mongodb_database.startswith('sahaay_demo'):
+            raise ValueError('ALLOW_WORKER_SIGNUP is demo-only: MONGODB_DATABASE must start with sahaay_demo (synthetic data only)')
         if self.environment != 'production': return self
         problems = []
         if self.seed_demo_data: problems.append('SEED_DEMO_DATA must be false in production')

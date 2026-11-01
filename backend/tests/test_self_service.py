@@ -192,3 +192,50 @@ def test_unknown_login_ids_get_the_same_generic_error_and_are_throttled(w):
     assert r.status_code == 401 and r.json()["detail"] == "Incorrect email or password"
     codes = [c.post("/api/auth/login", json={"email": "HW-ZZZZZZ", "password": "wrong-password-1"}).status_code for _ in range(6)]
     assert codes[-1] == 429
+
+
+# ================================================================ open health-worker sign-up (DEMO ONLY)
+def worker_signup(email="open.worker@example.com"):
+    return TestClient(main.app).post("/api/auth/register", json={"name": "Open Worker", "email": email, "password": "Correct-Horse-9!", "role": "worker"})
+
+
+def test_worker_signup_is_refused_by_default(w):
+    r = worker_signup()
+    assert r.status_code == 403 and w.mongo.users.find_one({"email": "open.worker@example.com"}) is None
+
+
+def test_worker_signup_when_the_demo_switch_is_on_creates_a_worker_who_can_use_the_worker_screen(w, monkeypatch):
+    monkeypatch.setattr(main.settings, "allow_worker_signup", True)
+    r = worker_signup()
+    assert r.status_code == 200 and r.json()["user"]["role"] == "worker"
+    u = w.mongo.users.find_one({"email": "open.worker@example.com"})
+    assert u["role"] == "worker" and "linked_patient_id" not in u                      # no patient record is made for staff
+    assert any(a["event_type"] == "ACCOUNT_REGISTERED" and "open demo" in a["description"] for a in w.mongo.audit.docs)
+    from app import security
+    main.app.dependency_overrides[security.current_user] = lambda: u
+    assert TestClient(main.app).get("/api/patients").status_code == 200
+
+
+def test_only_worker_and_patient_roles_can_self_register_even_with_the_switch_on(w, monkeypatch):
+    monkeypatch.setattr(main.settings, "allow_worker_signup", True)
+    for role in ("supervisor", "clinician"):
+        r = TestClient(main.app).post("/api/auth/register", json={"name": "Nope Nope", "email": f"{role}@example.com", "password": "Correct-Horse-9!", "role": role})
+        assert r.status_code == 403, role
+
+
+def test_worker_signup_is_throttled_like_other_registrations(w, monkeypatch):
+    monkeypatch.setattr(main.settings, "allow_worker_signup", True)
+    codes = [worker_signup(f"flood{i}@example.com").status_code for i in range(12)]
+    assert codes[:10] == [200] * 10 and codes[10:] == [429, 429]
+
+
+def test_the_demo_switch_cannot_be_turned_on_for_a_non_demo_database(monkeypatch):
+    import secrets
+    from pydantic import ValidationError
+    from app.config import Settings
+    for k in ("JWT_SECRET", "MONGODB_DATABASE", "ALLOW_WORKER_SIGNUP", "ENVIRONMENT", "CORS_ORIGINS"): monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MONGODB_URI", "mongodb://127.0.0.1:1/"); monkeypatch.setenv("JWT_SECRET", secrets.token_urlsafe(48)); monkeypatch.setenv("ALLOW_WORKER_SIGNUP", "true")
+    monkeypatch.setenv("MONGODB_DATABASE", "sahaay")
+    with pytest.raises(ValidationError): Settings(_env_file=None)
+    monkeypatch.setenv("MONGODB_DATABASE", "sahaay_demo")
+    assert Settings(_env_file=None).allow_worker_signup is True

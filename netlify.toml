@@ -7,6 +7,7 @@
 [build.environment]
   NODE_VERSION = "22"
   VITE_SEED_DEMO_DATA = "false"
+  VITE_ALLOW_WORKER_SIGNUP = "true"   # shows "Create health worker account" (DEMO ONLY; the backend must also have ALLOW_WORKER_SIGNUP=true)
 
 [[redirects]]
   from = "/*"
