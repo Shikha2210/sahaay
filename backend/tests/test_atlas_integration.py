@@ -107,7 +107,7 @@ def test_patient_persists_in_atlas(real, api):
     assert sync(c, create(pid))[0]["status"] == "applied"
     stored = database.patients.find_one({"patient_id": pid})
     assert stored and stored["name"] == "Atlas Test" and stored["identity_status"] == "UNVERIFIED" and stored["version"] == 1
-    assert stored["field_writers"]["name"] == "device-A"
+    assert stored["field_writers"]["name"].startswith("device-A|")        # device + the person who wrote it
 
 
 def test_unique_indexes_exist(real):
@@ -212,7 +212,7 @@ def test_stale_clinical_resolution_is_rejected_on_atlas(real, api):
     pid, cid = raise_conflict(database, "dosage", "10 mg", "20 mg")
     seen = fv(database, pid, "dosage")
     w, _ = actor(database, "worker")
-    assert sync(w, op("op-" + secrets.token_hex(6), pid, "device-A", 1, dosage="15 mg"))[0]["status"] == "applied"   # newer clinical value
+    assert sync(w, op("op-" + secrets.token_hex(6), pid, "device-A", seen, dosage="15 mg"))[0]["status"] == "applied"   # newer clinical value (made from the current version)
     cli, cu = actor(database, "clinician")
     r = cli.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_incoming", "expected_field_version": seen})
     assert r.status_code == 409 and code(r) == "stale_conflict" and r.json()["detail"]["current_value"] == "15 mg"
@@ -261,12 +261,12 @@ def test_concurrent_conflict_resolution_applies_exactly_once_on_atlas(real, api)
     assert database.changes.count_documents({"operation_id": "resolution:" + cid}) <= 1
 
 
-def test_supervisor_cannot_resolve_clinical_conflict_in_atlas(real, api):
+def test_worker_cannot_resolve_clinical_conflict_but_supervisor_can_in_atlas(real, api):
     _, database = real
     pid, cid = raise_conflict(database, "condition", "A", "B")
-    sup, _ = actor(database, "supervisor")
-    r = sup.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_incoming", "expected_field_version": fv(database, pid, "condition")})
-    assert r.status_code == 403 and code(r) == "role_not_permitted" and r.json()["detail"]["required_roles"] == ["clinician"]
+    wk, _ = actor(database, "worker")
+    r = wk.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "accept_incoming", "expected_field_version": fv(database, pid, "condition")})
+    assert r.status_code == 403 and code(r) == "role_not_permitted" and r.json()["detail"]["required_roles"] == ["clinician", "supervisor"]
     assert database.conflicts.find_one({"conflict_id": cid})["status"] == "pending"
     assert database.patients.find_one({"patient_id": pid})["condition"] == "A"
 

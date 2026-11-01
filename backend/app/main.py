@@ -229,11 +229,15 @@ class RetryableConflict(Exception):
     """The patient record changed under us inside the transaction; the client should retry the operation."""
 
 
+def writer_id(op,user):
+    """Who wrote a field: the DEVICE and the PERSON. Two different people on the same device are different writers (a shared tablet must not hide a real disagreement)."""
+    return f"{op.device_id}|{user['_id']}"
+
 def detect_field_conflicts(patient, incoming, base_version, device_id):
     """Field-level optimistic concurrency (pure function, no database access).
 
     A field is a CONFLICT when it was changed on the server after the version the client based its edit on,
-    UNLESS the last writer of that field is the same device (the device's own earlier operation, e.g. two
+    UNLESS the last writer of that field is the same device AND the same person (the device's own earlier operation, e.g. two
     sequential edits made offline). A newer write by anyone else is always a conflict: clinical data is never
     resolved by last-write-wins. Returns (updates, conflicting) where conflicting maps field -> current value.
     """
@@ -283,7 +287,7 @@ def apply_operation(op, user, session):
         db.operations.insert_one({'operation_id':op.operation_id,'patient_id':op.patient_id,'device_id':op.device_id,'actor_id':str(user['_id']),'base_version':op.base_version,'changes':op.changes,'status':response['status'],'response':response,'created_at':now},session=session)
     if not patient and is_create:
         doc=dict(incoming); doc.setdefault('identity_status','UNVERIFIED')
-        doc.update({'patient_id':op.patient_id,'version':1,'field_versions':{k:1 for k in incoming},'field_writers':{k:op.device_id for k in incoming},'created_at':now,'updated_at':now,'created_by':str(user['_id'])})
+        doc.update({'patient_id':op.patient_id,'version':1,'field_versions':{k:1 for k in incoming},'field_writers':{k:writer_id(op,user) for k in incoming},'created_at':now,'updated_at':now,'created_by':str(user['_id'])})
         db.patients.insert_one(doc,session=session)
         seq=next_seq(session); db.changes.insert_one({'seq':seq,'patient_id':op.patient_id,'version':1,'changes':incoming,'operation_id':op.operation_id,'created_at':now},session=session)
         response={'operation_id':op.operation_id,'patient_id':op.patient_id,'status':'applied','server_version':1,'applied_fields':list(incoming),'conflicts':[]}
@@ -294,7 +298,7 @@ def apply_operation(op, user, session):
         # No receipt is stored: the operation may become valid later (e.g. its create arrives), and a stored
         # rejection would permanently poison this operation_id.
         return {'operation_id':op.operation_id,'patient_id':op.patient_id,'status':'rejected','reason':'patient_not_found','conflicts':[]}
-    updates,conflicting=detect_field_conflicts(patient,incoming,op.base_version,op.device_id)
+    updates,conflicting=detect_field_conflicts(patient,incoming,op.base_version,writer_id(op,user))
     conflicts=[]
     for field,current in conflicting.items():
         cat=category(field); key=dedupe_key(incoming[field])
@@ -309,7 +313,7 @@ def apply_operation(op, user, session):
     if updates:
         new_version+=1
         set_doc={k:v for k,v in updates.items()}
-        set_doc.update({f'field_versions.{k}':new_version for k in updates}); set_doc.update({f'field_writers.{k}':op.device_id for k in updates})
+        set_doc.update({f'field_versions.{k}':new_version for k in updates}); set_doc.update({f'field_writers.{k}':writer_id(op,user) for k in updates})
         set_doc.update({'version':new_version,'updated_at':now})
         done=db.patients.update_one({'patient_id':op.patient_id,'version':patient.get('version',1)},{'$set':set_doc},session=session)
         if done.matched_count!=1: raise RetryableConflict()
@@ -366,11 +370,11 @@ def sync_pull(since_seq:int=Query(default=0,ge=0),limit:int=Query(default=200,ge
 POLICY={
  'DOCUMENT_VERIFIABLE':{'resolve_roles':{'supervisor','clinician'},'resolutions':{'apply_evidence'}},
  'PATIENT_VERIFIABLE':{'resolve_roles':{'supervisor','clinician'},'resolutions':{'apply_confirmation'}},
- 'CRITICAL_CLINICAL':{'resolve_roles':{'clinician'},'resolutions':{'accept_current','accept_incoming','custom'}},
- 'REQUIRES_REVIEW':{'resolve_roles':{'clinician'},'resolutions':{'accept_current','accept_incoming','custom'}},
+ 'CRITICAL_CLINICAL':{'resolve_roles':{'supervisor','clinician'},'resolutions':{'accept_current','accept_incoming','custom'}},
+ 'REQUIRES_REVIEW':{'resolve_roles':{'supervisor','clinician'},'resolutions':{'accept_current','accept_incoming','custom'}},
 }
 ALL_RESOLUTIONS={'apply_evidence','apply_confirmation','accept_current','accept_incoming','custom','reject_incoming'}
-REJECT_ROLES={'clinician'}
+REJECT_ROLES={'supervisor','clinician'}
 EVIDENCE_SUBMIT_ROLES=('worker','supervisor','clinician')
 AUDITED_REFUSALS={'role_not_permitted','stale_conflict','value_must_come_from_evidence','confirmation_no_longer_valid','resolution_not_allowed','approved_evidence_required','patient_confirmation_required'}
 
@@ -404,7 +408,7 @@ def allowed_actions(role,c,evidence,confirmations):
             if r=='apply_confirmation' and not any(x['status']=='confirmed' for x in confirmations): continue
             res.append(r)
     doc=c['category']=='DOCUMENT_VERIFIABLE'
-    return {'resolutions':res,'can_reject':role in REJECT_ROLES,'can_submit_evidence':doc and role in EVIDENCE_SUBMIT_ROLES,'can_review_evidence':doc and role=='clinician','can_confirm':role=='patient' and c['category']=='PATIENT_VERIFIABLE'}
+    return {'resolutions':res,'can_reject':role in REJECT_ROLES,'can_submit_evidence':doc and role in EVIDENCE_SUBMIT_ROLES,'can_review_evidence':doc and role in ('clinician','supervisor'),'can_confirm':role=='patient' and c['category']=='PATIENT_VERIFIABLE'}
 
 @app.get('/api/conflicts')
 def conflicts(status:str='pending',user=Depends(require_roles('supervisor','clinician'))):
@@ -491,7 +495,7 @@ def submit_evidence(conflict_id:str,body:EvidenceSubmitIn,user=Depends(require_r
     return {'evidence_reference':body.reference,'status':'pending_review','warning':'This records a reference only; it does not authenticate the document.'}
 
 @app.post('/api/conflicts/{conflict_id}/evidence/{evidence_reference}/review')
-def review_evidence(conflict_id:str,evidence_reference:str,body:EvidenceReviewIn,user=Depends(require_roles('clinician'))):
+def review_evidence(conflict_id:str,evidence_reference:str,body:EvidenceReviewIn,user=Depends(require_roles('clinician','supervisor'))):
     c=db.conflicts.find_one({'conflict_id':conflict_id})
     if not c: fail(404,'conflict_not_found','Conflict not found')
     if c['category']!='DOCUMENT_VERIFIABLE': fail(409,'not_document_verifiable','Evidence applies to document-verifiable conflicts only.')

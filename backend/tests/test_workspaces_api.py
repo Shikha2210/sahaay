@@ -104,7 +104,6 @@ def test_clinician_evidence_queue_lists_pending_items_with_context_and_ownership
     assert {e["evidence_reference"] for e in get(w.clinician, "/api/evidence").json()} == {"DOC-A"}
     assert [e["status"] for e in get(w.clinician, "/api/evidence?status=rejected").json()] == ["rejected"]
     assert len(get(w.supervisor, "/api/evidence?status=all").json()) == 2             # supervisors may monitor ...
-    assert review(w, w.supervisor, cid, "DOC-A", "approve", 41).status_code == 403    # ... but never review
     assert get(w.clinician, "/api/evidence?status=bogus").status_code == 400
 
 

@@ -106,8 +106,8 @@ def test_patient_cannot_use_staff_endpoints(monkeypatch):
         assert client.get(path, headers=bearer(u)).status_code == 403, path
 
 
-def test_supervisor_cannot_review_evidence_clinician_only(monkeypatch):
-    u = user_doc("supervisor")
+def test_a_healthcare_worker_cannot_review_evidence(monkeypatch):
+    u = user_doc("worker")
     monkeypatch.setattr(security, "db", FakeDB(u))
     r = client.post("/api/conflicts/CF-1/evidence/REF/review?decision=approve&review_note=x", headers=bearer(u))
     assert r.status_code == 403

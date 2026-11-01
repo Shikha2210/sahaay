@@ -276,30 +276,29 @@ def test_C1_patient_value_cannot_be_overridden_by_the_resolver_and_unlinking_inv
 
 # ================================================================================================= authorization matrix
 @pytest.mark.parametrize("field,a,b", [("condition", "A", "B"), ("last_visit", "2026-10-02", "2026-10-03")])
-def test_clinical_and_unclassified_conflicts_are_clinician_only(w, field, a, b):
+def test_clinical_and_unclassified_conflicts_need_a_supervisor_or_clinician_never_a_worker_or_patient(w, field, a, b):
     pid = new_patient(w); cid = raise_conflict(w, pid, field, a, b)
     v = detail(w, w.clinician, cid)["current_field_version"]
-    for who in (w.supervisor, w.worker, linked_patient(w, pid)):
+    for who in (w.worker, linked_patient(w, pid)):
         for res in ("accept_current", "accept_incoming", "reject_incoming"):
             r = resolve(w, who, cid, resolution=res, expected_field_version=v, note="try it")
             assert r.status_code == 403, (who["role"], res)
     assert detail(w, w.clinician, cid)["status"] == "pending" and patient(w)[field] == a
-    r = resolve(w, w.clinician, cid, resolution="accept_incoming", expected_field_version=v)
+    r = resolve(w, w.supervisor, cid, resolution="accept_incoming", expected_field_version=v)         # the supervisor approves (clinician sign-in was removed)
     assert r.status_code == 200 and patient(w)[field] == b
 
 
-def test_supervisor_refusal_is_a_structured_role_error_naming_the_required_role(w):
+def test_worker_refusal_is_a_structured_role_error_naming_the_required_roles(w):
     pid = new_patient(w); cid = raise_conflict(w, pid, "condition", "A", "B")
     v = detail(w, w.clinician, cid)["current_field_version"]
-    r = resolve(w, w.supervisor, cid, resolution="accept_incoming", expected_field_version=v)
+    r = resolve(w, w.worker, cid, resolution="accept_incoming", expected_field_version=v)
     d = r.json()["detail"]
-    assert r.status_code == 403 and d["code"] == "role_not_permitted" and d["required_roles"] == ["clinician"] and d["message"]
+    assert r.status_code == 403 and d["code"] == "role_not_permitted" and d["required_roles"] == ["clinician", "supervisor"] and d["message"]
 
 
 def test_other_endpoints_enforce_roles(w):
     pid = new_patient(w); cid = raise_conflict(w, pid, "age", 40, 41)
     evidence(w, w.worker, cid, "DOC-8", 41)
-    assert review(w, w.supervisor, cid, "DOC-8", "approve", 41).status_code == 403
     assert review(w, w.worker, cid, "DOC-8", "approve", 41).status_code == 403
     assert evidence(w, linked_patient(w, pid), cid, "DOC-9", 41).status_code == 403
     assert as_user(w.clinician).post(f"/api/admin/patients/{pid}/link-account", json={"email": "a@example.com", "identity_verified": True, "identity_check_method": "other", "identity_check_note": "checked ok"}).status_code == 403
@@ -433,7 +432,7 @@ def test_C10_linking_requires_a_recorded_identity_check_and_never_overwrites(w):
 def test_detail_tells_each_role_what_it_may_do_and_shows_the_current_state(w):
     pid = new_patient(w); cid = raise_conflict(w, pid, "condition", "A", "B")
     sup, cli = detail(w, w.supervisor, cid), detail(w, w.clinician, cid)
-    assert sup["allowed"]["resolutions"] == [] and sup["allowed"]["can_reject"] is False
+    assert sup["allowed"]["resolutions"] == ["accept_current", "accept_incoming", "custom"] and sup["allowed"]["can_reject"] is True
     assert cli["allowed"]["resolutions"] == ["accept_current", "accept_incoming", "custom"] and cli["allowed"]["can_reject"] is True
     assert cli["current_value"] == "A" and cli["current_field_version"] == 2 and "dedupe_key" not in cli
     listed = as_user(w.supervisor).get("/api/conflicts").json()[0]
@@ -450,7 +449,7 @@ def test_unknown_and_legacy_resolution_names_get_a_clear_structured_400(w):
 
 def test_every_conflict_refusal_has_the_same_structured_shape(w):
     pid = new_patient(w); cid = raise_conflict(w, pid, "condition", "A", "B")
-    attempts = [resolve(w, w.supervisor, cid, resolution="accept_current", expected_field_version=2), resolve(w, w.clinician, cid, resolution="nope"),
+    attempts = [resolve(w, w.worker, cid, resolution="accept_current", expected_field_version=2), resolve(w, w.clinician, cid, resolution="nope"),
                 resolve(w, w.clinician, "CF-NOPE", resolution="accept_current", expected_field_version=2), resolve(w, w.clinician, cid, resolution="accept_current"),
                 as_user(w.worker).get("/api/conflicts")]
     for r in attempts:
@@ -469,3 +468,19 @@ def test_synthetic_demo_conflicts_use_real_fields_and_can_never_be_resolved(w, m
     pid = demo[0]["patient_id"]
     r = resolve(w, w.clinician, demo[2]["conflict_id"], resolution="accept_incoming", expected_field_version=1)
     assert r.status_code == 400 and code(r) == "synthetic_conflict"
+
+
+# ---- two different people on the SAME device (a shared tablet) must still conflict, never silently overwrite each other
+def test_two_workers_on_the_same_device_editing_the_same_illness_field_raise_a_conflict(w):
+    pid = new_patient(w)
+    assert sync(w, op(pid, "shared-tablet", 1, condition="Asthma"))[0]["status"] == "applied"               # worker 1 (w.worker), device shared-tablet
+    other = w.user("worker")
+    r = as_user(other).post("/api/sync/batch", json={"operations": [op(pid, "shared-tablet", 1, condition="Diabetes")]}).json()["results"][0]
+    assert r["status"] == "conflict" and r["conflicts"][0]["field"] == "condition"
+    assert patient(w)["condition"] == "Asthma"                                                                # the second worker did not overwrite
+
+
+def test_the_same_person_editing_twice_on_their_own_device_is_still_not_a_conflict(w):
+    pid = new_patient(w)
+    assert sync(w, op(pid, "my-phone", 1, condition="Asthma"))[0]["status"] == "applied"
+    assert sync(w, op(pid, "my-phone", 1, condition="Asthma, mild"))[0]["status"] == "applied"

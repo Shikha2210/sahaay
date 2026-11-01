@@ -47,3 +47,7 @@ Refusals with codes `role_not_permitted`, `stale_conflict`, `resolution_not_allo
 
 ## Read-only endpoints added in Milestone 4 (policy unchanged)
 `GET /api/me/record` (patient: own linked record only) · `GET /api/sync/conflicts` (worker/supervisor/clinician: conflicts raised by the caller's own synchronised changes, with evidence status and outcome) · `GET /api/evidence?status=` (clinician and supervisor; reviewing remains clinician-only) · `GET /api/admin/patient-accounts` (supervisor only). `GET /api/me/conflicts` accepts `?status=` and returns outcomes for the patient's own patient-verifiable conflicts.
+
+## Change after Milestone 8 (clinician sign-in removed)
+* **Who wrote it:** a field's last writer is now the **device AND the person**. Two different workers on the same tablet/browser that edit the same detail from the same starting version raise a conflict; nothing is applied by time stamp or "last one wins". Only the same person editing again on their own device is treated as a follow-up edit.
+* **Approval:** because the clinician sign-in was removed, **supervisors may now resolve and reject clinical (`CRITICAL_CLINICAL`) and `REQUIRES_REVIEW` conflicts and review submitted evidence**, in addition to clinicians. Healthcare workers and patients still cannot. Trade-off: a single supervisor can now review the evidence and apply the value (previously two different roles); the audit history records who did each step.

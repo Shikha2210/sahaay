@@ -13,8 +13,8 @@ export const SENT_RESOLUTIONS = RESOLUTIONS;   // used by a contract test: every
 const WHO = {
   DOCUMENT_VERIFIABLE: 'A worker submits evidence, a clinician approves it and records the exact value, then a supervisor or clinician applies that value.',
   PATIENT_VERIFIABLE: 'The linked patient confirms the correct value; a supervisor or clinician then applies exactly that value.',
-  CRITICAL_CLINICAL: 'Only an authorized clinician may resolve clinical conflicts.',
-  REQUIRES_REVIEW: 'Fields without a verification route need an authorized clinician.',
+  CRITICAL_CLINICAL: 'A supervisor (or authorized clinician) approves clinical conflicts; healthcare workers and patients cannot.',
+  REQUIRES_REVIEW: 'Fields without a verification route need a supervisor or authorized clinician.',
 };
 const show = v => (v === null || v === undefined || v === '' ? '—' : String(v));
 const coerce = (field, text) => (field === 'age' ? (String(text).trim() === '' ? null : Number(text)) : text);
