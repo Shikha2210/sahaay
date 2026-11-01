@@ -38,6 +38,18 @@ export class ApiError extends Error {
   constructor(message, { status = 0, code = null, detail = null } = {}) { super(message); this.name = 'ApiError'; this.status = status; this.code = code; this.detail = detail; }
 }
 
+// FastAPI sends validation problems as a list; turn the first one into a sentence the person can act on.
+const FIELD_LABEL = { password: 'Password', email: 'Email address', name: 'Name', phone: 'Phone number', village: 'Village', role: 'Role' };
+function validationMessage(items) {
+  const it = items[0] || {}; const field = [...(it.loc || [])].reverse().find(x => typeof x === 'string' && x !== 'body');
+  const label = FIELD_LABEL[field] || 'One of the fields';
+  if (it.type === 'string_too_short') return `${label} is too short: it needs at least ${it.ctx?.min_length ?? 'more'} characters.`;
+  if (it.type === 'string_too_long') return `${label} is too long: at most ${it.ctx?.max_length ?? 'fewer'} characters.`;
+  if (field === 'email') return 'Enter a valid email address, for example name@example.com.';
+  if (it.type === 'missing') return `${label} is required.`;
+  return `${label} is not valid. Please check it and try again.`;
+}
+
 export async function api(path, rawOptions = {}) {
   const { timeoutMs, ...options } = rawOptions;   // timeoutMs: per-call override (the AI assistant needs longer than ordinary calls)
   const headers = new Headers(options.headers || {});
@@ -55,7 +67,7 @@ export async function api(path, rawOptions = {}) {
   const data = await response.json().catch(() => ({ detail: 'Unexpected server response' }));
   if (!response.ok) {
     const d = data.detail;
-    const message = typeof d === 'string' ? d : (d && d.message) || (Array.isArray(d) ? 'Some of the information entered is not valid.' : `Request failed (${response.status})`);
+    const message = typeof d === 'string' ? d : (d && d.message) || (Array.isArray(d) ? validationMessage(d) : `Request failed (${response.status})`);
     const code = d && typeof d === 'object' && !Array.isArray(d) ? d.code : null;
     const isAuthCall = path.startsWith('/api/auth/login') || path.startsWith('/api/auth/register');
     if (response.status === 401 && token && !isAuthCall) {

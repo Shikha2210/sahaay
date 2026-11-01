@@ -30,9 +30,9 @@ const approvedOk = () => probe('evidence_rows', P1).find(e => e.evidence_referen
 await section('patient: account not linked yet', async page => {
   R.check('patient1 signs in', !!(await login(page, 'patient', 'patient1')));
   R.check('navigation: Overview, My health, Confirm information, SAHAAY AI assistant, Identity & consent', JSON.stringify(await navLabels(page)) === JSON.stringify(['Overview', 'My health', 'Confirm information', 'SAHAAY AI assistant', 'Identity & consent']));
-  const t = await content(page);
+  await waitFor(async () => /not linked/.test(await content(page)), 10000, 300); const t = await content(page);
   R.check('overview says the account is not linked and shows NO record, appointment or demo data', /not linked to a health record yet/.test(t) && noFake(t).length === 0 && !t.includes(names[P1]), noFake(t).join(','));
-  await goNav(page, 'My health'); await sleep(500);
+  await goNav(page, 'My health'); await waitFor(async () => /not linked/.test(await content(page)), 10000, 300);
   R.check('"My health" shows the same honest empty state (no hard-coded "Asha Devi")', /not linked/.test(await content(page)) && noFake(await content(page)).length === 0);
   await shot(page, 'm4_patient_unlinked');
 });
