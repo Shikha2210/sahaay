@@ -52,6 +52,9 @@ _MISSING = object()
 def _match(doc, query):
     """Tiny subset of Mongo query matching: equality, dotted keys, $in, $ne, $exists, $regex-free."""
     for key, cond in (query or {}).items():
+        if key == "$or":
+            if not any(_match(doc, q) for q in cond): return False
+            continue
         val = _get(doc, key)
         if isinstance(cond, dict) and any(k.startswith("$") for k in cond):
             for op, arg in cond.items():
@@ -59,6 +62,7 @@ def _match(doc, query):
                 if op == "$ne" and val == arg: return False
                 if op == "$exists" and (val is not _MISSING) != bool(arg): return False
                 if op == "$type" and not (val is not _MISSING and isinstance(val, str)): return False
+                if op == "$elemMatch" and not (isinstance(val, list) and any(isinstance(i, dict) and _match(i, arg) for i in val)): return False
         elif val is _MISSING or val != cond:
             return False
     return True

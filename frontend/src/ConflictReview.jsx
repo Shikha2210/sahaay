@@ -18,11 +18,13 @@ const coerce = (field, text) => (field === 'age' ? (String(text).trim() === '' ?
 const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body) });
 
 export default function ConflictReview({ role, conflicts, refresh, notify, Head, Badge, Modal }) {
-  const [openId, setOpenId] = useState(null);
-  const pending = conflicts.filter(c => c.status === 'pending');
+  const [openId, setOpenId] = useState(null), [cat, setCat] = useState('ALL');
+  const allPending = conflicts.filter(c => c.status === 'pending');
+  const pending = cat === 'ALL' ? allPending : allPending.filter(c => c.category === cat);
   return <div className="content">
     <Head eyebrow="CLINICAL GOVERNANCE" title="Conflict review queue" sub="Route field conflicts according to verification policy. The server checks every decision against your role and the record's current version." />
-    {pending.length === 0 && <div className="info-card"><ShieldCheck /><p>No conflicts are waiting for review.</p></div>}
+    <div className="toolbar" style={{ gap: 8, flexWrap: 'wrap' }} role="group" aria-label="Filter by category">{[['ALL', 'All'], ['CRITICAL_CLINICAL', 'Clinical'], ['DOCUMENT_VERIFIABLE', 'Document'], ['PATIENT_VERIFIABLE', 'Patient-confirmed'], ['REQUIRES_REVIEW', 'Needs review']].map(([k, t]) => <button key={k} className={cat === k ? 'gradient-btn' : 'outline-btn'} onClick={() => setCat(k)}>{t} ({k === 'ALL' ? allPending.length : allPending.filter(c => c.category === k).length})</button>)}</div>
+    {pending.length === 0 && <div className="info-card"><ShieldCheck /><p>No conflicts are waiting for review{cat === 'ALL' ? '' : ' in this category'}.</p></div>}
     {pending.map(c => <div className="conflict-card" key={c.conflict_id}>
       <div>
         <Badge tone={c.category === 'CRITICAL_CLINICAL' ? 'amber' : 'purple'}>{c.category}</Badge>
@@ -38,7 +40,7 @@ export default function ConflictReview({ role, conflicts, refresh, notify, Head,
   </div>;
 }
 
-function ConflictDialog({ id, role, onClose, onChanged, notify, Modal, Badge }) {
+export function ConflictDialog({ id, role, onClose, onChanged, notify, Modal, Badge }) {
   const [d, setD] = useState(null), [err, setErr] = useState(''), [busy, setBusy] = useState(false);
   const [mode, setMode] = useState('accept_current'), [val, setVal] = useState(''), [note, setNote] = useState('');
   const [approved, setApproved] = useState({}), [reviewNote, setReviewNote] = useState({}), [ask, setAsk] = useState(null);

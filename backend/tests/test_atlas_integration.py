@@ -399,3 +399,87 @@ def test_audit_records_persist_with_actor_and_time(real, api):
     pid = new_pid(); sync(c, create(pid))
     rec = database.audit.find_one({"patient_id": pid, "event_type": "PATIENT_CREATED_SYNC"})
     assert rec["actor_id"] == str(u["_id"]) and rec["actor_role"] == "worker" and rec["created_at"]
+
+
+# 7 ------------------------------------------------------------------------------------------------------------
+# Milestone 4: the read endpoints behind the role workspaces, on REAL Atlas (query shapes such as $or/$elemMatch/$in).
+def link_account(database, sup, pid, account, **over):
+    body = {"email": account["email"], "identity_verified": True, "identity_check_method": "in_person_document", "identity_check_note": "checked a paper document", **over}
+    return sup.post(f"/api/admin/patients/{pid}/link-account", json=body)
+
+
+def make_patient_account(database, linked=None):
+    u = {"_id": ObjectId(), "role": "patient", "email": f"pat-{secrets.token_hex(3)}@example.com", "name": "patient", "active": True, "created_at": "2026-11-01"}
+    database.users.insert_one(dict(u))
+    return u
+
+
+def test_patient_sees_only_their_own_record_and_conflicts_on_atlas(real, api):
+    _, database = real
+    p1, c1 = raise_conflict(database, "phone", "9111111111", "9222222222")
+    p2, c2 = raise_conflict(database, "phone", "9333333333", "9444444444")
+    sup, _ = actor(database, "supervisor")
+    a1, a2, a3 = make_patient_account(database), make_patient_account(database), make_patient_account(database)
+    assert link_account(database, sup, p1, a1).status_code == 200 and link_account(database, sup, p2, a2).status_code == 200
+
+    def as_patient(acct, pid):
+        u = {**acct, **({"linked_patient_id": pid} if pid else {})}
+        main.app.dependency_overrides[security.current_user] = lambda: u
+        return TestClient(main.app)
+
+    me1 = as_patient(a1, p1).get("/api/me/record").json()
+    assert me1["patient_id"] == p1 and me1["record"]["name"] and "field_versions" not in me1["record"] and "created_by" not in me1["record"]
+    assert [c["conflict_id"] for c in as_patient(a1, p1).get("/api/me/conflicts").json()["conflicts"]] == [c1]
+    assert [c["conflict_id"] for c in as_patient(a2, p2).get("/api/me/conflicts").json()["conflicts"]] == [c2]
+    assert as_patient(a3, None).get("/api/me/record").json() == {"linked": False}
+    assert as_patient(a1, p1).post(f"/api/patients/{p2}/confirm-field", json={"conflict_id": c2, "confirmed_value": "9444444444"}).status_code == 403
+
+
+def test_worker_conflict_notifications_use_real_mongo_queries_on_atlas(real, api):
+    _, database = real
+    w1, u1 = actor(database, "worker")
+    pid = new_pid(); sync(w1, create(pid, "device-A"))
+    assert sync(w1, op("op-" + secrets.token_hex(6), pid, "device-A", 1, age=40))[0]["status"] == "applied"
+    r = sync(w1, op("op-" + secrets.token_hex(6), pid, "device-B", 1, age=41))[0]
+    cid = r["conflicts"][0]["conflict_id"]
+    mine = TestClient(main.app).get("/api/sync/conflicts").json()
+    assert [c["conflict_id"] for c in mine["conflicts"]] == [cid] and mine["open_count"] == 1 and mine["conflicts"][0]["can_submit_evidence"] is True
+    other, u2 = actor(database, "worker")                               # a different worker sees nothing of it
+    assert other.get("/api/sync/conflicts").json()["conflicts"] == []
+    again = sync(other, op("op-" + secrets.token_hex(6), pid, "device-C", 1, age=41))[0]       # ... until they propose the same value (history match)
+    assert again["conflicts"][0]["conflict_id"] == cid
+    assert [c["conflict_id"] for c in other.get("/api/sync/conflicts").json()["conflicts"]] == [cid]
+    assert other.post(f"/api/conflicts/{cid}/evidence", json={"reference": "REG-1", "description": "register page", "claimed_value": 41}).status_code == 200
+    item = other.get("/api/sync/conflicts").json()["conflicts"][0]
+    assert item["evidence"][0]["status"] == "pending_review" and item["evidence"][0]["submitted_by_me"] is True
+    cli, _ = actor(database, "clinician")
+    assert cli.post(f"/api/conflicts/{cid}/evidence/REG-1/review", json={"decision": "approve", "review_note": "ok ok", "approved_value": 42}).status_code == 200
+    sup, _ = actor(database, "supervisor")
+    assert sup.post(f"/api/conflicts/{cid}/resolve", json={"resolution": "apply_evidence", "evidence_reference": "REG-1", "expected_field_version": fv(database, pid, "age")}).status_code == 200
+    main.app.dependency_overrides[security.current_user] = lambda: u2
+    done = TestClient(main.app).get("/api/sync/conflicts?status=resolved").json()["conflicts"][0]
+    assert done["status"] == "resolved" and done["selected_value"] == 42 and done["evidence"][0]["approved_value"] == 42 and done["can_submit_evidence"] is False
+
+
+def test_clinician_evidence_queue_and_supervisor_account_list_on_atlas(real, api):
+    _, database = real
+    pid, cid = raise_conflict(database, "age", 40, 41)
+    wk, _ = actor(database, "worker")
+    assert wk.post(f"/api/conflicts/{cid}/evidence", json={"reference": "Q-1", "description": "register page", "claimed_value": 41}).status_code == 200
+    cli, cu = actor(database, "clinician")
+    q = [e for e in cli.get("/api/evidence").json() if e["conflict_id"] == cid]
+    assert len(q) == 1 and q[0]["field"] == "age" and q[0]["claimed_value"] == 41 and q[0]["submitted_by_me"] is False
+    assert cli.post(f"/api/conflicts/{cid}/evidence/Q-1/review", json={"decision": "reject", "review_note": "unreadable"}).status_code == 200
+    assert [e for e in cli.get("/api/evidence").json() if e["conflict_id"] == cid] == []
+    assert [e["status"] for e in cli.get("/api/evidence?status=rejected").json() if e["conflict_id"] == cid] == ["rejected"]
+    wk2, _ = actor(database, "worker")
+    assert wk2.get("/api/evidence").status_code == 403
+    sup, _ = actor(database, "supervisor")
+    acct = make_patient_account(database)
+    rows = sup.get("/api/admin/patient-accounts").json()
+    mine = next(r for r in rows if r["email"] == acct["email"])
+    assert mine["linked_patient_id"] is None and "password" not in str(rows).lower()
+    assert link_account(database, sup, pid, acct).status_code == 200
+    assert next(r for r in sup.get("/api/admin/patient-accounts").json() if r["email"] == acct["email"])["linked_patient_id"] == pid
+    w3, _ = actor(database, "worker")                                  # identity overrides are global: switch back to a worker explicitly
+    assert w3.get("/api/admin/patient-accounts").status_code == 403

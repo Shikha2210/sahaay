@@ -41,6 +41,14 @@ elif cmd == "remote_edit":
 elif cmd == "patient_fields":
     p = db.patients.find_one({"patient_id": args[0]}) or {}
     print(json.dumps({k: p.get(k) for k in ("age", "name", "phone", "condition", "dosage", "last_visit", "version")}))
+elif cmd == "evidence_rows":
+    print(json.dumps([{k: e.get(k) for k in ("evidence_reference", "status", "claimed_value", "approved_value", "submitted_role", "reviewed_by")} | {"submitted_by_worker1": e.get("submitted_by") == S["users"]["worker1"]["id"]} for e in db.evidence.find({"patient_id": args[0]})]))
+elif cmd == "confirmations":
+    print(json.dumps([{k: x.get(k) for k in ("field", "confirmed_value", "status")} | {"by_patient1": x.get("user_id") == S["users"]["patient1"]["id"]} for x in db.patient_confirmations.find({"patient_id": args[0]})]))
+elif cmd == "account":
+    u = db.users.find_one({"email": args[0]}) or {}
+    ic = u.get("identity_check") or {}
+    print(json.dumps({"linked_patient_id": u.get("linked_patient_id"), "method": ic.get("method"), "checked_by_supervisor": bool(ic.get("checked_by")), "has_note": bool(ic.get("note")), "linked_by": bool(u.get("linked_by"))}))
 elif cmd == "counts":
     print(json.dumps({n: db[n].count_documents({}) for n in ("users", "patients", "operations", "changes", "conflicts", "audit", "evidence", "patient_confirmations")}))
 c.close()

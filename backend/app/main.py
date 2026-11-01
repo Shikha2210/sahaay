@@ -325,15 +325,31 @@ def conflict_detail(conflict_id:str,user=Depends(require_roles('supervisor','cli
     v.update(evidence=ev,confirmations=cf,allowed=allowed_actions(user['role'],c,ev,cf))
     return v
 
+PATIENT_VISIBLE=('patient_id','name','age','phone','village','condition','diagnosis','medications','allergies','treatment_plan','blood_pressure','blood_glucose','dosage','last_visit','identity_status','version','updated_at','created_at')
+
+@app.get('/api/me/record')
+def my_record(user=Depends(require_roles('patient'))):
+    """The signed-in patient's OWN linked record (never anyone else's). Internal bookkeeping fields are not returned."""
+    pid=user.get('linked_patient_id')
+    if not pid: return {'linked':False}
+    p=db.patients.find_one({'patient_id':pid})
+    if not p: return {'linked':True,'patient_id':pid,'record':None}
+    return {'linked':True,'patient_id':pid,'record':{k:p[k] for k in PATIENT_VISIBLE if k in p}}
+
 @app.get('/api/me/conflicts')
-def my_conflicts(user=Depends(require_roles('patient'))):
-    """The signed-in patient's OWN eligible conflicts (patient-verifiable, pending, on the record linked to this account)."""
+def my_conflicts(status:str='pending',user=Depends(require_roles('patient'))):
+    """The signed-in patient's OWN eligible conflicts (patient-verifiable, on the record linked to this account)."""
+    if status not in {'pending','resolved','rejected','all'}: fail(400,'invalid_status',"status must be pending, resolved, rejected or all")
     pid=user.get('linked_patient_id')
     if not pid: return {'linked':False,'conflicts':[]}
+    q={'patient_id':pid,'category':'PATIENT_VERIFIABLE'}
+    if status!='all': q['status']=status
     out=[]
-    for c in db.conflicts.find({'patient_id':pid,'category':'PATIENT_VERIFIABLE','status':'pending'}).sort('created_at',-1).limit(100):
+    for c in db.conflicts.find(q).sort('created_at',-1).limit(100):
         mine=db.patient_confirmations.find_one({'conflict_id':c['conflict_id'],'user_id':str(user['_id'])})
-        out.append({'conflict_id':c['conflict_id'],'patient_id':pid,'field':c['field'],'value_a':c['value_a'],'value_b':c['value_b'],'created_at':c['created_at'],'my_confirmation':({'confirmation_id':mine['confirmation_id'],'confirmed_value':mine['confirmed_value']} if mine else None)})
+        item={'conflict_id':c['conflict_id'],'patient_id':pid,'field':c['field'],'status':c['status'],'value_a':c['value_a'],'value_b':c['value_b'],'created_at':c['created_at'],'my_confirmation':({'confirmation_id':mine['confirmation_id'],'confirmed_value':mine['confirmed_value'],'confirmed_at':mine.get('confirmed_at')} if mine else None)}
+        if c['status']!='pending': item.update(selected_value=c.get('selected_value'),resolved_at=c.get('resolved_at'))
+        out.append(item)
     return {'linked':True,'patient_id':pid,'conflicts':out}
 
 @app.post('/api/patients/{patient_id}/confirm-field')
@@ -481,6 +497,42 @@ def link_patient_account(patient_id:str,body:LinkAccountIn,user=Depends(require_
     if r.matched_count!=1: fail(409,'account_already_linked','This account is already linked to another patient record.')
     audit(patient_id,user,'PATIENT_ACCOUNT_LINKED','Patient account linked after a recorded identity check',{'account_id':str(account['_id']),'identity_check_method':body.identity_check_method})
     return {'linked':True,'already_linked':False,'patient_id':patient_id}
+
+@app.get('/api/sync/conflicts')
+def my_sync_conflicts(status:str='all',user=Depends(require_roles('worker','supervisor','clinician'))):
+    """Conflict notifications: conflicts that came from THIS user's own synchronised changes (or evidence they submitted), with the outcome."""
+    if status not in {'pending','resolved','rejected','all'}: fail(400,'invalid_status',"status must be pending, resolved, rejected or all")
+    uid=str(user['_id'])
+    q={'$or':[{'actor_id':uid},{'history':{'$elemMatch':{'actor_id':uid,'action':{'$in':['created','proposed_again','evidence_submitted']}}}}]}
+    if status!='all': q['status']=status
+    rows=list(db.conflicts.find(q).sort('created_at',-1).limit(200))
+    ev={}
+    for e in db.evidence.find({'conflict_id':{'$in':[r['conflict_id'] for r in rows]}}): ev.setdefault(e['conflict_id'],[]).append(e)
+    pats={p['patient_id']:p for p in db.patients.find({'patient_id':{'$in':list({r['patient_id'] for r in rows})}})}
+    out=[]
+    for c in rows:
+        cur,fv=field_state(pats.get(c['patient_id']) or {},c['field'])
+        evidence=[{'evidence_reference':e['evidence_reference'],'status':e['status'],'claimed_value':e.get('claimed_value'),'approved_value':e.get('approved_value'),'review_note':e.get('review_note'),'submitted_by_me':e.get('submitted_by')==uid} for e in ev.get(c['conflict_id'],[])]
+        item={'conflict_id':c['conflict_id'],'patient_id':c['patient_id'],'field':c['field'],'category':c['category'],'status':c['status'],'value_a':c['value_a'],'value_b':c['value_b'],'current_value':cur,'created_at':c['created_at'],'evidence':evidence,'can_submit_evidence':c['category']=='DOCUMENT_VERIFIABLE' and c['status']=='pending' and not c.get('synthetic')}
+        if c['status']!='pending': item.update(resolution=c.get('resolution'),selected_value=c.get('selected_value'),resolved_at=c.get('resolved_at'))
+        out.append(item)
+    return {'open_count':sum(1 for x in out if x['status']=='pending'),'conflicts':out}
+
+@app.get('/api/evidence')
+def evidence_queue(status:str='pending_review',user=Depends(require_roles('clinician','supervisor'))):
+    """Evidence waiting for (or already given) clinician review, with the conflict it belongs to. Reviewing stays clinician-only."""
+    if status not in {'pending_review','approved','rejected','all'}: fail(400,'invalid_status',"status must be pending_review, approved, rejected or all")
+    rows=list(db.evidence.find({} if status=='all' else {'status':status}).sort('created_at',-1).limit(200))
+    cons={c['conflict_id']:c for c in db.conflicts.find({'conflict_id':{'$in':[r['conflict_id'] for r in rows]}})}
+    return [{'evidence_reference':r['evidence_reference'],'conflict_id':r['conflict_id'],'patient_id':r['patient_id'],'field':(cons.get(r['conflict_id']) or {}).get('field'),'conflict_status':(cons.get(r['conflict_id']) or {}).get('status'),'status':r['status'],'claimed_value':r.get('claimed_value'),'approved_value':r.get('approved_value'),'description':r.get('description'),'submitted_role':r.get('submitted_role'),'created_at':r['created_at'],'submitted_by_me':r.get('submitted_by')==str(user['_id'])} for r in rows]
+
+@app.get('/api/admin/patient-accounts')
+def patient_accounts(user=Depends(require_roles('supervisor'))):
+    """Patient logins and whether each is linked to a record (for the linking screen). No password data."""
+    out=[]
+    for u in db.users.find({'role':'patient','active':True}).sort('created_at',-1).limit(500):
+        out.append({'email':u['email'],'name':u['name'],'linked_patient_id':u.get('linked_patient_id'),'linked_at':u.get('linked_at'),'identity_check_method':(u.get('identity_check') or {}).get('method'),'created_at':u.get('created_at')})
+    return out
 
 @app.post('/api/identity/{patient_id}/attempt')
 def identity_attempt(patient_id:str,body:IdentityAttemptIn,user=Depends(require_roles('worker','supervisor'))):

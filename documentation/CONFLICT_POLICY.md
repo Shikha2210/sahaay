@@ -44,3 +44,6 @@ Refusals with codes `role_not_permitted`, `stale_conflict`, `resolution_not_allo
 * Evidence is a **reference** to a document held elsewhere; the system records a human decision and does not authenticate documents.
 * The identity check behind account linking is the supervisor's attestation; the system cannot verify it.
 * A patient can only choose between the two proposed values.
+
+## Read-only endpoints added in Milestone 4 (policy unchanged)
+`GET /api/me/record` (patient: own linked record only) · `GET /api/sync/conflicts` (worker/supervisor/clinician: conflicts raised by the caller's own synchronised changes, with evidence status and outcome) · `GET /api/evidence?status=` (clinician and supervisor; reviewing remains clinician-only) · `GET /api/admin/patient-accounts` (supervisor only). `GET /api/me/conflicts` accepts `?status=` and returns outcomes for the patient's own patient-verifiable conflicts.

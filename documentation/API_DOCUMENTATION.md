@@ -54,3 +54,12 @@ FastAPI default `{"detail": "..."}`; validation errors return 422 with a list. T
 ---
 # Conflict API — replaced in Milestone 3
 The conflict, evidence, confirmation and account-linking rows in the table above describe the OLD contract. The current contract (JSON bodies, structured errors, `expected_field_version`, new resolution names, `GET /api/conflicts/{id}`, `GET /api/me/conflicts`, `POST /api/patients/{id}/confirm-field`, `?status=` filter) is documented in `CONFLICT_POLICY.md`.
+
+## Added in Milestone 4 (all role-gated; 401 without a token)
+| Endpoint | Roles | Purpose |
+|---|---|---|
+| `GET /api/me/record` | patient | own linked record (no internal fields); `{linked:false}` if not linked |
+| `GET /api/me/conflicts?status=` | patient | own patient-verifiable conflicts with outcomes |
+| `GET /api/sync/conflicts?status=` | worker, supervisor, clinician | conflicts from the caller's own synced changes (notifications) + evidence outcomes |
+| `GET /api/evidence?status=` | clinician, supervisor | evidence queue/history with conflict context |
+| `GET /api/admin/patient-accounts` | supervisor | patient logins and link status (no secrets) |

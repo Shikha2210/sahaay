@@ -158,3 +158,13 @@ Full evidence and reproduction steps in `MILESTONE_2C_REPORT.md`.
 # Status after Milestone 3 (2026-11-02) — conflict engine
 C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11: **FIXED** (details, root causes, tests: `MILESTONE_3_REPORT.md`; policy: `CONFLICT_POLICY.md`). Verified with 32 in-memory logic tests, 5 contract tests, 19 real-Atlas integration tests and a 23-check real-browser run on a disposable database.
 Still open / newly noted: patient UI to confirm (API ready), worker evidence submission UI + conflict notices (S11), link-account UI, clinician dashboard, no unlink flow for mistaken links, evidence is a reference only, patient may choose only between the two proposed values, any field change forces re-review, X5/X7 unchanged.
+
+---
+# Status after Milestone 4 (2026-11-02) — role workspaces
+* **F1** clinician had no UI → **FIXED** (dedicated dashboard, evidence review, resolution history).
+* **F2** no UI for evidence submission/review, patient confirmation, account linking → **FIXED** for those four; staff creation UI still missing.
+* **F3** hard-coded patient/worker/supervisor dashboard content → **FIXED** on the patient, worker, supervisor dashboards and the patient pages (guarded by a contract test). Prototype text remains on the Sync centre/monitoring pages.
+* **S11** workers had no conflict notifications → **FIXED** (page + bell, real counts).
+* **X8** patients could not read their own record → **FIXED** (`/api/me/record`, own record only).
+* **New (found and fixed):** sentences with bold text inside conflict cards rendered split by the app's flex CSS.
+* **Still open:** S5 (rejected operations look successful), clinician audit-history view, supervisor Audit page placeholder, staff creation UI, no unlink flow, offline behaviour of the new screens untested, mobile/accessibility untested.
