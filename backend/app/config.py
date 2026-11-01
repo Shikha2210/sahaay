@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     # No default: only needed when no supervisor exists yet. Validated when used (see bootstrap()).
     bootstrap_supervisor_password: str = Field(default='', alias='BOOTSTRAP_SUPERVISOR_PASSWORD')
     seed_demo_data: bool = Field(default=False, alias='SEED_DEMO_DATA')
+    # true: a patient who signs up immediately gets their OWN new health record (no supervisor approval). They never get access to anyone else's.
+    # false: the earlier mode where a supervisor must link the account to an existing record after an identity check.
+    self_service_patient_records: bool = Field(default=True, alias='SELF_SERVICE_PATIENT_RECORDS')
     # 'production' turns on the strict checks below (no API docs, HSTS, https-only origins, no demo data, no example accounts).
     environment: str = Field(default='development', alias='ENVIRONMENT')
     # Pull the real client address from X-Forwarded-For only when this is true (and only behind a proxy you control).

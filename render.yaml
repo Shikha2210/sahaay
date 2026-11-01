@@ -14,6 +14,7 @@ services:
       - { key: ENVIRONMENT, value: production }
       - { key: TRUST_PROXY_HEADERS, value: "true" }       # Render's proxy sets X-Forwarded-For
       - { key: SEED_DEMO_DATA, value: "false" }
+      - { key: SELF_SERVICE_PATIENT_RECORDS, value: "true" }   # new patients get their own record at sign-up (no supervisor approval)
       - { key: MONGODB_DATABASE, value: sahaay_demo }
       - { key: JWT_EXPIRE_MINUTES, value: "60" }
       - { key: MONGODB_URI, sync: false }

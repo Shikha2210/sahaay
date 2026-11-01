@@ -87,6 +87,22 @@ def health():
     try: client.admin.command('ping'); return {'status':'ok','mongodb':'connected','database':settings.mongodb_database}
     except Exception: raise HTTPException(503,'MongoDB is unavailable')
 
+def _create_own_record(account):
+    """Self-service sign-up: give the new patient a brand-new record of their own and link it at once.
+    This grants access to NOTHING that already exists - the record is empty apart from the name they typed - so no supervisor check is
+    needed to protect anyone else's data. (Linking an account to a record that staff already created still requires the supervisor's
+    recorded identity check.) Failure here leaves a normal unlinked account, never a broken sign-up."""
+    try:
+        now=UTC(); pid='SH-'+uuid.uuid4().hex[:8].upper()
+        rec={'patient_id':pid,'name':account['name'],'identity_status':'UNVERIFIED','version':1,'field_versions':{'name':1},'field_writers':{},'created_at':now,'updated_at':now,'created_by':str(account['_id']),'self_registered':True}
+        db.patients.insert_one(rec)
+        seq=next_seq(None); db.changes.insert_one({'seq':seq,'patient_id':pid,'version':1,'changes':{'name':account['name']},'operation_id':'self-'+pid,'created_at':now})
+        db.users.update_one({'_id':account['_id'],'linked_patient_id':{'$exists':False}},{'$set':{'linked_patient_id':pid,'linked_by':'self_registration','linked_at':now,'identity_check':{'verified':False,'method':'self_registered','note':'Own new record created at sign-up; no existing record was linked','checked_by':None,'checked_at':now}}})
+        audit(pid,account,'PATIENT_SELF_REGISTERED','Patient created their own record at sign-up (no existing record linked)',{})
+        account['linked_patient_id']=pid
+    except PyMongoError:
+        pass
+
 @app.post('/api/auth/register')
 def register(body:RegisterIn,request:Request):
     if body.role!='patient': raise HTTPException(403,'Public registration can only create patient accounts')
@@ -98,6 +114,7 @@ def register(body:RegisterIn,request:Request):
     except DuplicateKeyError: raise HTTPException(409,'Email already registered')
     doc['_id']=result.inserted_id
     audit_security('ACCOUNT_REGISTERED',doc,'Patient account registered',{})
+    if settings.self_service_patient_records: _create_own_record(doc)
     return {'access_token':create_token(doc),'token_type':'bearer','user':public_user(doc)}
 
 @app.post('/api/auth/login')
