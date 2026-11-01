@@ -3,7 +3,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from bson.errors import InvalidId
-from jose import jwt, JWTError, ExpiredSignatureError
+import jwt                                  # PyJWT (replaces python-jose, which pulled in unmaintained crypto dependencies)
+from jwt import PyJWTError as JWTError, ExpiredSignatureError
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
@@ -39,7 +40,7 @@ def _unauthorized(code: str, message: str):
 
 def current_user(token: str = Depends(oauth)):
     try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM], options={'require_exp': True, 'require_sub': True})
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM], options={'require': ['exp', 'sub']})
     except ExpiredSignatureError:
         raise _unauthorized('token_expired', 'Your session has expired. Please sign in again.')
     except JWTError:
@@ -85,4 +86,6 @@ class LoginRateLimiter:
         with self._lock: self._fails.pop(key, None)
 
 
-login_limiter = LoginRateLimiter()
+login_limiter = LoginRateLimiter()                                         # per address + account
+ip_login_limiter = LoginRateLimiter(max_failures=30, window_seconds=300)   # per address, across accounts (password spraying)
+register_limiter = LoginRateLimiter(max_failures=10, window_seconds=3600)  # self-registrations per address per hour

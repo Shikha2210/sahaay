@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
-from jose import jwt
+import jwt
 from app import main, security
 from app.config import settings
 from app.security import create_token, hash_password, login_limiter

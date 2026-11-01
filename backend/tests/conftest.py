@@ -38,3 +38,11 @@ def as_role():
 @pytest.fixture(scope="session")
 def app_jsx_source():
     return APP_JSX.read_text(encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiters():
+    """Failed-login / registration counters are per process; every test starts with clean ones."""
+    from app import security
+    for lim in (security.login_limiter, security.ip_login_limiter, security.register_limiter): lim._fails.clear()
+    yield

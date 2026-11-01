@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Always backend/.env, no matter which folder the server is started from.
@@ -72,7 +72,11 @@ class Settings(BaseSettings):
     # No default: only needed when no supervisor exists yet. Validated when used (see bootstrap()).
     bootstrap_supervisor_password: str = Field(default='', alias='BOOTSTRAP_SUPERVISOR_PASSWORD')
     seed_demo_data: bool = Field(default=False, alias='SEED_DEMO_DATA')
-    model_config = SettingsConfigDict(env_file=str(ENV_FILE), extra='ignore', populate_by_name=True)
+    # 'production' turns on the strict checks below (no API docs, HSTS, https-only origins, no demo data, no example accounts).
+    environment: str = Field(default='development', alias='ENVIRONMENT')
+    # Pull the real client address from X-Forwarded-For only when this is true (and only behind a proxy you control).
+    trust_proxy_headers: bool = Field(default=False, alias='TRUST_PROXY_HEADERS')
+    model_config = SettingsConfigDict(env_file=str(ENV_FILE), extra='ignore', populate_by_name=True, hide_input_in_errors=True)   # a failed validation must never print the secret it rejected
 
     @field_validator('jwt_secret')
     @classmethod
@@ -93,6 +97,31 @@ class Settings(BaseSettings):
         if not origins or '*' in origins:
             raise ValueError('CORS_ORIGINS must list explicit origins; "*" is not allowed with credentials')
         return v
+
+
+    @field_validator('environment')
+    @classmethod
+    def _check_env(cls, v):
+        v = (v or 'development').strip().lower()
+        if v not in ('development', 'production'):
+            raise ValueError('ENVIRONMENT must be development or production')
+        return v
+
+    @model_validator(mode='after')
+    def _production_rules(self):
+        if self.environment != 'production': return self
+        problems = []
+        if self.seed_demo_data: problems.append('SEED_DEMO_DATA must be false in production')
+        origins = [x.strip() for x in self.cors_origins.split(',') if x.strip()]
+        if any(not o.startswith('https://') for o in origins): problems.append('CORS_ORIGINS must be https:// origins only in production (no localhost)')
+        if self.bootstrap_supervisor_email.lower().endswith(('@example.com', '@example.org', '@test.com')) and self.bootstrap_supervisor_password:
+            problems.append('BOOTSTRAP_SUPERVISOR_EMAIL must be a real address you control, not an example domain')
+        if self.groq_api_url.startswith('http://'): problems.append('GROQ_API_URL must be https:// in production')
+        if not self.mongodb_uri.startswith('mongodb+srv://') and 'tls=true' not in self.mongodb_uri.lower() and 'ssl=true' not in self.mongodb_uri.lower():
+            problems.append('MONGODB_URI must use TLS (mongodb+srv:// or tls=true) in production')
+        if self.mongodb_database.startswith('sahaay_test_'): problems.append('MONGODB_DATABASE is a test database name')
+        if problems: raise ValueError('Unsafe production configuration: ' + '; '.join(problems))
+        return self
 
 
 settings = Settings()

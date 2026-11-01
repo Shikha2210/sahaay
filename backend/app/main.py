@@ -10,7 +10,7 @@ from app.config import settings
 from app.db import client, db, init_db
 from app import ai
 from app.schemas import RegisterIn, LoginIn, PatientIn, BatchIn, ResolveIn, IdentityAttemptIn, ChatIn, SummaryIn, ExplainIn, operation_problem, validate_change_values, EvidenceSubmitIn, EvidenceReviewIn, ConfirmIn, LinkAccountIn
-from app.security import hash_password, verify_password, create_token, current_user, require_roles, public_user, login_limiter
+from app.security import hash_password, verify_password, create_token, current_user, require_roles, public_user, login_limiter, ip_login_limiter, register_limiter
 from app.config import validate_bootstrap_password, validate_bootstrap_email
 
 UTC=lambda: datetime.now(timezone.utc).isoformat()
@@ -57,7 +57,15 @@ def bootstrap():
 @asynccontextmanager
 async def lifespan(app):
     init_db(); bootstrap(); yield; client.close()
-app=FastAPI(title='SAHAAY API',version='3.0.0',lifespan=lifespan)
+PRODUCTION=settings.environment=='production'
+app=FastAPI(title='SAHAAY API',version='3.0.0',lifespan=lifespan,**({'docs_url':None,'redoc_url':None,'openapi_url':None} if PRODUCTION else {}))
+
+def client_ip(request:Request):
+    """Address of the caller. X-Forwarded-For is believed only when TRUST_PROXY_HEADERS=true (set it only behind your own proxy)."""
+    if settings.trust_proxy_headers:
+        fwd=request.headers.get('x-forwarded-for','').split(',')[-1].strip()
+        if fwd: return fwd[:64]
+    return request.client.host if request.client else 'unknown'
 origins=[x.strip() for x in settings.cors_origins.split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=False,allow_methods=['GET','POST','OPTIONS'],allow_headers=['Authorization','Content-Type'])
 
@@ -67,6 +75,10 @@ async def security_headers(request: Request, call_next):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=(), payment=()'
+    response.headers['Cross-Origin-Resource-Policy'] = 'same-site'
+    response.headers['Content-Security-Policy'] = "default-src 'none'; frame-ancestors 'none'"   # the API only returns JSON
+    if PRODUCTION: response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     if request.url.path.startswith('/api/'): response.headers['Cache-Control'] = 'no-store'  # no PHI in shared caches
     return response
 
@@ -76,8 +88,11 @@ def health():
     except Exception: raise HTTPException(503,'MongoDB is unavailable')
 
 @app.post('/api/auth/register')
-def register(body:RegisterIn):
+def register(body:RegisterIn,request:Request):
     if body.role!='patient': raise HTTPException(403,'Public registration can only create patient accounts')
+    rip=client_ip(request)
+    if register_limiter.blocked(rip): raise HTTPException(429,'Too many accounts were created from this address. Try again later.',headers={'Retry-After':'3600'})
+    register_limiter.record_failure(rip)
     doc={'name':body.name.strip(),'email':body.email.lower(),'password_hash':hash_password(body.password),'role':'patient','active':True,'created_at':UTC()}
     try: result=db.users.insert_one(doc)
     except DuplicateKeyError: raise HTTPException(409,'Email already registered')
@@ -87,11 +102,11 @@ def register(body:RegisterIn):
 
 @app.post('/api/auth/login')
 def login(body:LoginIn,request:Request):
-    ip=request.client.host if request.client else 'unknown'
+    ip=client_ip(request)
     key=f"{ip}|{body.email.lower()}"
     who_hash=hashlib.sha256(body.email.lower().encode()).hexdigest()[:16]   # attempted account is recorded as a hash, not the address
     anon={'_id':'anonymous','role':'anonymous'}
-    if login_limiter.blocked(key):
+    if login_limiter.blocked(key) or ip_login_limiter.blocked(ip):
         if time.monotonic()-_blocked_logged.get(key,-1e9)>300:
             _blocked_logged[key]=time.monotonic(); audit_security('LOGIN_BLOCKED',anon,'Sign-in blocked after repeated failures',{'ip':ip,'account_hash':who_hash})
         raise HTTPException(429,'Too many failed sign-in attempts. Wait a few minutes and try again.',headers={'Retry-After':'300'})
@@ -99,7 +114,7 @@ def login(body:LoginIn,request:Request):
     # Same message and similar work whether the account exists or not (no account enumeration).
     valid=verify_password(body.password,user['password_hash']) if user else (verify_password(body.password,_DUMMY_HASH) and False)
     if not valid:
-        login_limiter.record_failure(key)
+        login_limiter.record_failure(key); ip_login_limiter.record_failure(ip)
         audit_security('LOGIN_FAILED',anon,'Failed sign-in attempt',{'ip':ip,'account_hash':who_hash,'reason':'wrong_password' if user else 'unknown_account'})
         raise HTTPException(401,'Incorrect email or password')
     login_limiter.reset(key)
